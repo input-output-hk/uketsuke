@@ -1,0 +1,6 @@
+{
+  "service": "http://127.0.0.1:4100",
+  "network": "leios-prototype",
+  "campaign": "glue",
+  "lifetime_secs": 900
+}

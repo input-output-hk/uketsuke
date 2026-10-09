@@ -1,0 +1,12 @@
+/_build/
+/deps/
+/tmp/
+# Zigler's generated copy of a module's Zig source.
+/lib/**/.Elixir.*.zig
+/client/node_modules/
+/var/
+/roster.json
+/config.local.json
+/fresh-request/
+/.direnv/
+/request/

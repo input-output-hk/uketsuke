@@ -1,0 +1,7 @@
+{
+  "name": "uketsuke-bls-signing-example",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "dependencies": { "@noble/curves": "2.4.0" }
+}

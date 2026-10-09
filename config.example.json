@@ -1,0 +1,15 @@
+{
+  "port": 4100,
+  "service": "http://127.0.0.1:4100",
+  "network": "leios-prototype",
+  "campaign": "glue",
+  "storage_dir": "./var/inbox",
+  "roster_path": "./roster.json",
+  "max_file_bytes": 104857600,
+  "max_total_bytes": 1073741824,
+  "max_inflight": 4,
+  "max_manifest_bytes": 8192,
+  "max_lifetime_secs": 900,
+  "upload_timeout_ms": 120000,
+  "roster_max_age_secs": 3600
+}
