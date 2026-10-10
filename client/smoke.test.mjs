@@ -37,6 +37,7 @@ requiredEnv('AWS_SECRET_ACCESS_KEY');
 const serverCommand = process.env.INBOX_SERVER_COMMAND
   ? process.env.INBOX_SERVER_COMMAND.trim().split(/\s+/)
   : ['mix', 'run', '--no-halt']; // Developer launcher; packaged smoke selects the release explicitly.
+const signer = requiredEnv('UKETSUKE_SIGN');
 const awsEnv = { ...process.env, AWS_DEFAULT_REGION: region, AWS_EC2_METADATA_DISABLED: 'true' };
 
 function aws(...args) {
@@ -114,7 +115,7 @@ async function faultProxy(fail) {
   };
 }
 
-await test('real signed uploads: Node signer, Elixir/blst, and S3 Archive', { timeout: 240000 }, async t => {
+await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive', { timeout: 240000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'uketsuke-smoke-'));
   let server;
   let output = '';
@@ -238,21 +239,20 @@ await test('real signed uploads: Node signer, Elixir/blst, and S3 Archive', { ti
     return socket;
   }
   await start();
-  const sign = out => JSON.parse(execFileSync(process.execPath, [join(root, 'client/sign.mjs'), '--key', join(dir, 'bls.skey'),
+  const sign = out => JSON.parse(execFileSync(signer, ['--key', join(dir, 'bls.skey'),
     '--file', reportPath, '--pool', pool, '--campaign', join(dir, 'campaign.json'), '--out', join(dir, out)], { encoding: 'utf8' }));
-  const send = (...args) => spawnSync(process.execPath, [join(root, 'client/upload.mjs'), ...args], { encoding: 'utf8' });
-  const receiptOf = (...args) => {
-    const result = send(...args);
+  const curl = (out, config) => spawnSync('curl', ['-K', join(dir, out, config)], { encoding: 'utf8' });
+  const receiptOf = (out, config) => {
+    const result = curl(out, config);
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
   };
 
-  await t.test('signer and uploader publish one self-verifiable Bundle in S3', async () => {
+  await t.test('signer and curl publish one self-verifiable Bundle in S3', async () => {
     const signed = sign('request');
     assert.equal(signed.public_key, key);
     assert.equal(signed.file_hash, digest);
-    const receipt = receiptOf(join(dir, 'request'));
-    assert.deepEqual(JSON.parse(await readFile(join(dir, 'request/receipt.json'), 'utf8')), receipt);
+    const receipt = receiptOf('request', 'upload.curl');
     assert.equal(receipt.submission_id, signed.submission_id);
     assert.equal(receipt.file_hash, digest);
     assert.equal(receipt.file_size, report.length);
@@ -266,12 +266,12 @@ await test('real signed uploads: Node signer, Elixir/blst, and S3 Archive', { ti
   });
   const original = JSON.parse(await readFile(join(dir, 'request/manifest.json'), 'utf8'));
   await t.test('retries and refreshed GET return the original Receipt without another object', async () => {
-    assert.deepEqual(receiptOf(join(dir, 'request')), receiptOf('--receipt', join(dir, 'request')));
+    assert.deepEqual(receiptOf('request', 'upload.curl'), receiptOf('request', 'receipt.curl'));
     sign('unsent');
-    const missing = send('--receipt', join(dir, 'unsent'));
-    assert.equal(missing.status, 1, missing.stdout);
-    assert.match(missing.stderr, /answered 404: .*receipt_not_found/);
-    await assert.rejects(readFile(join(dir, 'unsent/receipt.json')), { code: 'ENOENT' });
+    const missing = curl('unsent', 'receipt.curl');
+    assert.equal(missing.status, 22, missing.stdout);
+    assert.match(missing.stderr, /404/);
+    assert.match(missing.stdout, /receipt_not_found/);
     assert.deepEqual(keys(), [objectKey(original.submission_id)]);
     const refreshed = { ...original, expires_at: original.expires_at + 1 };
     const response = await fetch(`${service}/v1/receipts/${original.submission_id}`, { headers: authentication(refreshed) });

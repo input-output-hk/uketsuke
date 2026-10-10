@@ -1,0 +1,18 @@
+.{
+    .name = .uketsuke_sign,
+    .version = "0.1.0",
+    .fingerprint = 0xd721ae61893a6fdb, // Changing this has security and trust implications.
+    // zigler pins the server's NIF to the same Zig release.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .blst = .{
+            .url = "https://github.com/supranational/blst/archive/refs/tags/v0.3.17.tar.gz",
+            .hash = "blst-0.3.17-pWUN_nxeLgAMRveed9s7nBMqCLdWMTjX_WNto9K4Oozb",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

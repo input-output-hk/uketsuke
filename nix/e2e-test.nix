@@ -1,6 +1,7 @@
 {
   pkgs,
   package,
+  signer,
   floci,
   module,
 }:
@@ -41,7 +42,7 @@ let
   };
   client = pkgs.runCommand "uketsuke-smoke-client" { } ''
     mkdir -p "$out/client" "$out/nix"
-    cp ${../client}/*.mjs "$out/client/"
+    cp ${../client/smoke.test.mjs} "$out/client/smoke.test.mjs"
     cp ${./module-smoke.mjs} "$out/nix/module-smoke.mjs"
     ln -s ${nodeModules}/node_modules "$out/client/node_modules"
     ln -s ${nodeModules}/node_modules "$out/nix/node_modules"
@@ -55,11 +56,12 @@ let
     export INBOX_S3_BUCKET=uketsuke
     export INBOX_S3_REGION=${region}
     export INBOX_SERVER_COMMAND="${package}/bin/uketsuke start"
+    export UKETSUKE_SIGN=${pkgs.lib.getExe signer}
     export RELEASE_DISTRIBUTION=none
     export RELEASE_COOKIE=uketsuke-test-nondistributed
     export ERL_FLAGS="+S 2:2"
     if [ "$#" -eq 0 ]; then
-      exec ${pkgs.nodejs_24}/bin/node --test ${client}/client/sign.test.mjs ${client}/client/smoke.test.mjs
+      exec ${pkgs.nodejs_24}/bin/node --test ${client}/client/smoke.test.mjs
     fi
     exec ${pkgs.nodejs_24}/bin/node ${client}/nix/module-smoke.mjs "$@"
   '';

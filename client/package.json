@@ -1,5 +1,5 @@
 {
-  "name": "uketsuke-bls-signing-example",
+  "name": "uketsuke-smoke",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },

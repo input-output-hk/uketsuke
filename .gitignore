@@ -4,6 +4,9 @@
 # Zigler's generated copy of a module's Zig source.
 /lib/**/.Elixir.*.zig
 /client/node_modules/
+/client/.zig-cache/
+/client/zig-out/
+/client/zig-pkg/
 /var/
 /roster.json
 /config.local.json

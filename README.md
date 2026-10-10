@@ -7,25 +7,29 @@ and publishes one uncompressed evidence Bundle per Submission to S3.
 
 ### Client ergonomics
 
-Signing and transport are both Node; no curl or native client binary is needed.
-Signing requires local code: the checked
+Signing is a local Zig binary, `uketsuke-sign`; transport is curl. Signing
+requires local code: the checked
 [cardano-cli node command surface](https://github.com/IntersectMBO/cardano-cli/blob/b788cd365e3dd6246d9099018f093ba351779f9c/cardano-cli/test/cardano-cli-golden/files/golden/help/dijkstra_node.cli)
-generates BLS keys but exposes no arbitrary-message signer. This prototype
-ships an inspectable JavaScript signer, `client/sign.mjs`, using the
-`@noble/curves` version pinned in `client/package.json`, and an uploader,
-`client/upload.mjs`, that uses only Node's standard library. Both require the
-Node version named in that file's `engines` field; this does **not** achieve
-zero additional client tooling. No key enters the server, the uploader or a
-browser. Use disposable keys while evaluating this prototype.
-
-Run from this directory, after inspecting the signer and dependencies:
+generates BLS keys but exposes no arbitrary-message signer. The signer links
+[blst](https://github.com/supranational/blst), the library the server verifies
+with, at the version pinned by hash in `client/build.zig.zon`. It is a static
+binary without runtime dependencies and makes no network requests. No key
+enters the server, curl or a browser. Use disposable keys while evaluating
+this prototype.
 
 ```console
-npm ci --prefix client --ignore-scripts --no-audit --no-fund
-node client/sign.mjs --key /secure/path/bls.skey --file report.zip --pool POOL_HEX --campaign campaign.example.json --out request
-node client/upload.mjs request
-node client/upload.mjs --receipt request
+nix run .#uketsuke-sign -- --key /secure/path/bls.skey --file report.zip --pool POOL_HEX --campaign campaign.example.json --out request
+curl -K request/upload.curl
+curl -K request/receipt.curl
 ```
+
+Signing hosts without Nix get a static, stripped Linux binary. `nix build
+.#uketsuke-sign-release` cross-builds `uketsuke-sign-<version>-x86_64-linux`
+and `uketsuke-sign-<version>-aarch64-linux` (musl, no dynamic loader) plus
+`SHA256SUMS`. The build is bit-for-bit reproducible (`nix build --rebuild`
+agrees), so an operator can check a downloaded binary by rebuilding at the
+release commit and comparing it against `SHA256SUMS`. Copy the binary to the
+signing host and run `sha256sum -c --ignore-missing SHA256SUMS` there.
 
 Replace `POOL_HEX` with the pool's 56-character lowercase hex ID. The service
 operator distributes one campaign JSON and destination to the Discord channel,
@@ -35,30 +39,39 @@ use an identifier tied unambiguously to its genesis, not just a friendly name.
 Only loopback HTTP is permitted by the signer; remote origins must use HTTPS.
 
 Signing reads the local report incrementally, hashes it with SHA-256 and signs
-a manifest. It makes no network requests. It accepts both current and historical
-`Mininimal` BLS TextEnvelope spellings, rejects cold keys and invalid scalars,
-and writes a new private request directory without overwriting one:
-`manifest.json` holds the exact signed bytes and `request.json` the signature,
-public key and the report's absolute path, never the signing key.
+a manifest. It accepts both current and historical `Mininimal` BLS
+TextEnvelope spellings, rejects cold keys and invalid scalars, and writes a new
+private request directory without overwriting one: `manifest.json` holds the
+exact signed bytes; `upload.curl` and `receipt.curl` are curl config files with
+the destination URL, the report's absolute path, the base64 manifest, public
+key and signature, never the signing key.
 
-The uploader re-checks the report's size and SHA-256 against the signed
-manifest, sends it with an exact `Content-Length`, prints the receipt and saves
-it as `request/receipt.json`. `--receipt` fetches the receipt without sending
-the report. Any non-2xx answer exits 1 with the server's status and JSON error.
-Keep the report and request directory until the receipt is saved.
+`curl -K request/upload.curl` sends the report with an exact `Content-Length`
+and prints the receipt; save it. `receipt.curl` fetches the receipt without
+sending the report. The configs need curl 7.76.0 or newer: older curl ignores
+`fail-with-body` with a warning and exits 0 on a rejection. A 4xx/5xx answer
+makes curl exit 22 with the status on stderr and the server's JSON error on
+stdout. Redirects are not followed, so a 3xx from a proxy in front of the
+service exits 0 without printing a receipt. Both configs disable curl's URL
+globbing, so `[]` and `{}` in report paths and IPv6 hosts stay literal. curl
+does not re-hash the report; a report changed after signing is rejected (422)
+and never published. Keep the report and request directory until the receipt
+is saved.
 
 Retries with the same ID and immutable metadata return the original receipt;
 conflicting content gets 409. After expiry, rerun the signing command with
 `--id PREVIOUS_SUBMISSION_ID --out fresh-request` and unchanged file/metadata,
-then run `node client/upload.mjs --receipt fresh-request`. Receipt lookup
+then run `curl -K fresh-request/receipt.curl`. Receipt lookup
 requires a currently accepted roster key, so an outage or key rotation can
 prevent recovery with an old key.
 
 ### Build and test
 
-The Nix development shell supplies Elixir/OTP, Zig, blst, Node, zip, tar, AWS
-CLI and the `floci-dev` launcher. Zigler uses `ZIG_EXECUTABLE_PATH` and links
-`$BLST_DIR/lib/libblst.a`; both are set by the shell.
+The Nix development shell supplies Elixir/OTP, Zig, blst, Node, curl, zip,
+tar, AWS CLI and the `floci-dev` launcher. Zigler uses `ZIG_EXECUTABLE_PATH`
+and links `$BLST_DIR/lib/libblst.a`; both are set by the shell. Node and
+`@noble/curves` serve only the smoke harness, which forges malformed and
+foreign-domain requests; operators never need them.
 
 ```console
 nix develop
@@ -67,13 +80,16 @@ mix deps.get
 mix compile --warnings-as-errors
 npm ci --prefix client --ignore-scripts --no-audit --no-fund
 mix test
-node --test client/sign.test.mjs
-nix build .#uketsuke
+zig build --build-file client/build.zig test
+nix build .#uketsuke .#uketsuke-sign
 ```
 
 `mix test` covers Manifest validation, real BLS authorization, Bundle round
 trips and malformed archives. S3 integration tests are
-tagged `s3` and excluded unless explicitly included.
+tagged `s3` and excluded unless explicitly included. `zig build test` covers
+the signer: the cardano-cli golden key in both spellings, rejected cold keys and
+out-of-range scalars, signature verification and domain separation, campaign
+and origin validation, and curl config escaping.
 
 **Backend prerequisite:** the Archive needs atomic `If-None-Match: *` and
 `If-Match` PUT semantics. Production uses AWS S3. Development and the NixOS
@@ -96,20 +112,22 @@ contacts AWS and stops the emulator on exit.
 
 ```nu
 open /tmp/uketsuke-floci/env.json | load-env
+zig build --build-file client/build.zig
+$env.UKETSUKE_SIGN = (pwd | path join client/zig-out/bin/uketsuke-sign)
 mix test --include s3
-node --test client/sign.test.mjs client/smoke.test.mjs
+node --test client/smoke.test.mjs
 nix build .#checks.x86_64-linux.smoke
 ```
 
-The Node smoke runs a real signed ZIP through the server and checks S3 Bundle
-bytes, rejection paths, interrupted/stalled transfers, Receipt replay, and quota
-after restart with empty staging. The NixOS
-smoke runs the packaged release without runtime compilation, plus a separate
-`services.uketsuke` instance for loopback confinement and restart checks. It
-also restarts Floci itself and checks that the Bundle ETag, quota ledger and
-registered key survive while a wrong secret is still rejected.
+The smoke signs a real ZIP with `uketsuke-sign`, sends it with curl through the
+server and checks S3 Bundle bytes, rejection paths, interrupted/stalled
+transfers, Receipt replay, and quota after restart with empty staging. The NixOS
+smoke runs the packaged release and signer without runtime compilation, plus a
+separate `services.uketsuke` instance for loopback confinement and restart
+checks. It also restarts Floci itself and checks that the Bundle ETag, quota
+ledger and registered key survive while a wrong secret is still rejected.
 `INBOX_SERVER_COMMAND="/path/to/bin/uketsuke start"` selects the release launcher
-in the Node smoke; otherwise it uses `mix run --no-halt`.
+in the smoke; otherwise it uses `mix run --no-halt`.
 
 ### Run and deploy
 
@@ -130,8 +148,10 @@ The Key Roster format is
 It must come from a trusted chain query, not from the Operator uploading data.
 Uketsuke neither generates the roster nor consults reward membership.
 
-The flake exports `packages.<system>.uketsuke`, `nixosModules.uketsuke`, and
-`checks.<system>.release` / `checks.<system>.smoke`. Example module configuration:
+The flake exports `packages.<system>.uketsuke`, `packages.<system>.uketsuke-sign`,
+`packages.<system>.uketsuke-sign-release`,
+`nixosModules.uketsuke`, and `checks.<system>.release` / `checks.<system>.sign`
+/ `checks.<system>.smoke`. Example module configuration:
 
 ```nix
 {
