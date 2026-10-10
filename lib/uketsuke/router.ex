@@ -2,22 +2,85 @@ defmodule Uketsuke.Router do
   @behaviour Plug
   import Plug.Conn
   require Logger
-  alias Uketsuke.{Auth, Store}
+  alias Uketsuke.{Error, Intake}
+
+  @statuses %{
+    "invalid_id" => 400,
+    "missing_header" => 400,
+    "manifest_too_large" => 413,
+    "invalid_manifest" => 400,
+    "invalid_key" => 400,
+    "invalid_signature" => 401,
+    "invalid_signature_encoding" => 400,
+    "wrong_protocol" => 400,
+    "wrong_service" => 403,
+    "wrong_network" => 403,
+    "wrong_campaign" => 403,
+    "id_mismatch" => 400,
+    "invalid_pool" => 400,
+    "invalid_hash" => 400,
+    "invalid_size" => 400,
+    "file_too_large" => 413,
+    "invalid_filename" => 400,
+    "invalid_expiry" => 400,
+    "expired_manifest" => 401,
+    "expiry_too_far" => 400,
+    "key_not_registered" => 403,
+    "roster_unavailable" => 503,
+    "verifier_unavailable" => 503,
+    "upload_in_progress" => 409,
+    "inflight_limit" => 429,
+    "storage_quota" => 507,
+    "submission_conflict" => 409,
+    "receipt_not_found" => 404,
+    "storage_failed" => 500,
+    "upload_timeout" => 408,
+    "size_mismatch" => 422,
+    "hash_mismatch" => 422,
+    "body_read_failed" => 400,
+    "invalid_content_length" => 400
+  }
+
+  @private_messages %{
+    "storage_failed" => "artifact storage failed",
+    "roster_unavailable" => "key roster is unavailable",
+    "verifier_unavailable" => "signature verifier is unavailable"
+  }
 
   @impl true
   def init(config), do: config
 
   @impl true
-  def call(conn, config) do
+  def call(conn, context) do
     case {conn.method, conn.path_info} do
       {"GET", ["health"]} -> json(conn, 200, %{status: "ready"})
-      {"PUT", ["v1", "uploads", id]} -> request(conn, id, :upload, config)
-      {"GET", ["v1", "receipts", id]} -> request(conn, id, :receipt, config)
+      {"PUT", ["v1", "uploads", id]} -> request(conn, id, :upload, context)
+      {"GET", ["v1", "receipts", id]} -> request(conn, id, :receipt, context)
       _ -> error(conn, 404, "not_found", "route not found")
     end
   rescue
+    exception in Error ->
+      status = Map.fetch!(@statuses, exception.code)
+
+      message =
+        case Map.fetch(@private_messages, exception.code) do
+          {:ok, public} ->
+            Logger.error("#{exception.code}: #{Exception.message(exception)}")
+            public
+
+          :error ->
+            exception.message
+        end
+
+      code =
+        if exception.code == "invalid_signature_encoding",
+          do: "invalid_signature",
+          else: exception.code
+
+      error(conn, status, code, message)
+
     exception in File.Error ->
-      Logger.error("inbox storage failed: #{Exception.message(exception)}")
+      Logger.error("inbox staging failed: #{Exception.message(exception)}")
       error(conn, 500, "storage_failed", "artifact storage failed")
 
     exception in Bandit.HTTPError ->
@@ -27,212 +90,18 @@ defmodule Uketsuke.Router do
         "body_read_failed",
         "request body could not be read"
       )
-  catch
-    {:http_error, status, code, message} -> error(conn, status, code, message)
   end
 
-  defp request(conn, id, mode, config) do
-    deadline = System.monotonic_time(:millisecond) + config["upload_timeout_ms"]
-    auth = Auth.parse!(conn, id, config)
+  defp request(conn, id, mode, {config, s3}) do
+    {conn, disposition, receipt} = Intake.request!(conn, id, mode, config, s3)
 
-    case Store.reserve(id, auth.manifest, mode, deadline) do
-      {:ok, token, existing, stage} ->
-        try do
-          auth = Auth.authorize!(auth, config)
-
-          cond do
-            not is_nil(existing) ->
-              existing_receipt(conn, auth, existing)
-
-            mode == :receipt ->
-              Auth.fail!(404, "receipt_not_found", "submission has no durable receipt")
-
-            true ->
-              upload(conn, auth, token, stage, deadline)
-          end
-        after
-          Store.release(token)
-        end
-
-      {:error, status, code, message} ->
-        Auth.fail!(status, code, message)
-    end
-  end
-
-  defp existing_receipt(conn, auth, existing) do
-    Auth.require!(
-      Auth.immutable(auth.manifest) == Auth.immutable(existing.manifest),
-      409,
-      "submission_conflict",
-      "submission id already has different immutable metadata"
-    )
-
-    try do
-      Uketsuke.Native.confirm!(existing.path)
-    rescue
-      exception in File.Error ->
-        Logger.error("receipt confirmation failed: #{Exception.message(exception)}")
-        Auth.fail!(500, "storage_failed", "artifact durability could not be confirmed")
-    end
-
-    json(conn, 200, existing.receipt)
-  end
-
-  defp upload(conn, auth, token, stage, deadline) do
-    manifest = auth.manifest
-    check_content_length!(conn, manifest["file_size"])
-    File.mkdir!(stage)
-    File.chmod!(stage, 0o700)
-    path = Path.join(stage, "report.zip")
-    file = File.open!(path, [:write, :binary, :exclusive, :raw])
-
-    conn =
-      try do
-        File.chmod!(path, 0o600)
-        receive_body(conn, file, manifest, deadline, 0, :crypto.hash_init(:sha256))
-      after
-        case File.close(file) do
-          :ok -> :ok
-          {:error, reason} -> raise File.Error, reason: reason, action: "close", path: path
-        end
+    status =
+      case disposition do
+        :created -> 201
+        :existing -> 200
       end
 
-    final = Store.body_complete(token)
-
-    receipt =
-      manifest
-      |> Map.take(~w(submission_id file_hash file_size pool_id filename))
-      |> Map.merge(%{
-        "durability" => "local-fsync",
-        "stored_at" => DateTime.utc_now() |> DateTime.to_iso8601()
-      })
-
-    evidence!(stage, "manifest.json", auth.bytes)
-
-    evidence!(
-      stage,
-      "attestation.json",
-      Jason.encode!(%{public_key: auth.key, signature: auth.signature})
-    )
-
-    evidence!(stage, "roster.json", auth.roster_bytes)
-    evidence!(stage, "receipt.json", Jason.encode!(receipt))
-
-    result =
-      try do
-        Uketsuke.Native.seal!(stage)
-        Store.publish!(token)
-        Uketsuke.Native.settle!(stage, final)
-      rescue
-        exception in File.Error ->
-          Logger.error(
-            "publish #{manifest["submission_id"]} failed: #{Exception.message(exception)}"
-          )
-
-          {:error, 500, "storage_failed", "artifact publication could not be confirmed"}
-      end
-
-    Store.commit(token, result == :ok)
-
-    case result do
-      :ok -> json(conn, 201, receipt)
-      {:error, status, code, message} -> Auth.fail!(status, code, message)
-    end
-  end
-
-  defp receive_body(conn, file, manifest, deadline, size, hash) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-    Auth.require!(remaining > 0, 408, "upload_timeout", "upload read deadline exceeded")
-    # Copy granularity only: acceptance is bounded by the signed file_size.
-    chunk_size = min(64 * 1024, manifest["file_size"] - size + 1)
-
-    case read_body(conn, length: chunk_size, read_length: chunk_size, read_timeout: remaining) do
-      {status, chunk, conn} when status in [:ok, :more] ->
-        size = size + byte_size(chunk)
-
-        Auth.require!(
-          size <= manifest["file_size"],
-          422,
-          "size_mismatch",
-          "body is larger than signed file_size"
-        )
-
-        Auth.require!(
-          System.monotonic_time(:millisecond) < deadline,
-          408,
-          "upload_timeout",
-          "upload read deadline exceeded"
-        )
-
-        case :file.write(file, chunk) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            raise File.Error, reason: reason, action: "write", path: "staged report.zip"
-        end
-
-        hash = :crypto.hash_update(hash, chunk)
-
-        if status == :more do
-          receive_body(conn, file, manifest, deadline, size, hash)
-        else
-          Auth.require!(
-            size == manifest["file_size"],
-            422,
-            "size_mismatch",
-            "body is shorter than signed file_size"
-          )
-
-          digest = :crypto.hash_final(hash) |> Base.encode16(case: :lower)
-
-          Auth.require!(
-            digest == manifest["file_hash"],
-            422,
-            "hash_mismatch",
-            "body SHA-256 does not match signed file_hash"
-          )
-
-          conn
-        end
-
-      {:error, reason} ->
-        Auth.fail!(400, "body_read_failed", "request body read failed: #{inspect(reason)}")
-    end
-  end
-
-  defp check_content_length!(conn, expected) do
-    case get_req_header(conn, "content-length") do
-      [] ->
-        :ok
-
-      [value] ->
-        case Integer.parse(value) do
-          {size, ""} when size >= 0 ->
-            Auth.require!(
-              size == expected,
-              422,
-              "size_mismatch",
-              "Content-Length differs from signed file_size"
-            )
-
-          _ ->
-            Auth.fail!(
-              400,
-              "invalid_content_length",
-              "Content-Length must be a nonnegative integer"
-            )
-        end
-
-      _ ->
-        Auth.fail!(400, "invalid_content_length", "duplicate Content-Length")
-    end
-  end
-
-  defp evidence!(stage, name, bytes) do
-    path = Path.join(stage, name)
-    File.write!(path, bytes, [:exclusive])
-    File.chmod!(path, 0o600)
+    json(conn, status, receipt)
   end
 
   defp error(conn, status, code, message),
@@ -242,7 +111,7 @@ defmodule Uketsuke.Router do
     conn
     |> put_resp_content_type("application/json")
     |> put_resp_header("cache-control", "no-store")
-    # Close rather than letting the adapter drain an unauthenticated/retried body.
+    # Reject rather than draining an unauthenticated or already-published body.
     |> put_resp_header("connection", "close")
     |> send_resp(status, Jason.encode!(value))
   end

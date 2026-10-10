@@ -1,10 +1,9 @@
 # Uketsuke
 
 Uketsuke (受付, “reception desk”) is an inbox for one-off data collections.
-This prototype accepts BLS-signed ZIP uploads, independently of metsuke's
-telemetry and reward policies. The Elixir/Plug/Bandit server uses a Zig NIF,
-built by Zigler, that links `blst` for verification and makes the Linux
-syscalls for atomic publication and filesystem syncs.
+It accepts BLS-signed ZIP uploads independently of Metsuke telemetry and reward
+policies. The Elixir/Plug/Bandit server uses a Zigler/blst NIF for verification
+and publishes one uncompressed evidence Bundle per Submission to S3.
 
 ### Client ergonomics
 
@@ -55,94 +54,184 @@ then run `node client/upload.mjs --receipt fresh-request`. Receipt lookup
 requires a currently accepted roster key, so an outage or key rotation can
 prevent recovery with an old key.
 
-### Run the server and exercise the full path
+### Build and test
 
-Prerequisites: Linux, Zig, blst, Elixir/OTP, Node, npm; the smoke also uses zip.
-`flake.nix` provides them as the default dev shell (`nix develop`, or direnv).
-`mix compile` builds the NIF with the Zig named by `ZIG_EXECUTABLE_PATH` and
-statically links `$BLST_DIR/lib/libblst.a`; the dev shell sets both:
+The Nix development shell supplies Elixir/OTP, Zig, blst, Node, zip, tar, AWS
+CLI and the `floci-dev` launcher. Zigler uses `ZIG_EXECUTABLE_PATH` and links
+`$BLST_DIR/lib/libblst.a`; both are set by the shell.
 
 ```console
-# From this prototype directory
-nix develop --command nu
+nix develop
 mix local.hex --force
 mix deps.get
-mix compile
+mix compile --warnings-as-errors
 npm ci --prefix client --ignore-scripts --no-audit --no-fund
+mix test
+node --test client/sign.test.mjs
+nix build .#uketsuke
 ```
 
-The following commands are Nushell. `mix test` checks the NIF directly:
-blst against signatures from `@noble/curves`, classification of keys and
-signatures outside the prime-order subgroups, no-replace publication, refusal of
-symlinks, nested directories and FIFOs, and a sync failure after the rename. The
-Node smoke creates public test-key fixtures, a real ZIP and an ephemeral server;
-it exercises actual uploads through `client/upload.mjs`, archive bytes,
-cryptographic rejection, interrupted transfers, quotas and restart recovery. It
-removes its temporary data and stops the server:
+`mix test` covers Manifest validation, real BLS authorization, Bundle round
+trips and malformed archives. S3 integration tests are
+tagged `s3` and excluded unless explicitly included.
+
+**Backend prerequisite:** the Archive needs atomic `If-None-Match: *` and
+`If-Match` PUT semantics. Production uses AWS S3. Development and the NixOS
+smoke use [Floci](https://github.com/floci-io/floci) 2.2.0 (MIT), whose native
+server is taken from the image pinned by
+[floci-nix](https://github.com/imxade/floci-nix) and runs without a container
+runtime. Garage ignores those conditions and cannot back this service; see
+[Garage known issues](https://garagehq.deuxfleurs.fr/documentation/reference-manual/known-issues/).
+Floci is a test emulator, not a storage backend for deployment.
+
+`nix run .#floci-dev -- /tmp/uketsuke-floci` starts Floci on
+`127.0.0.1:4566` with persistent state and SigV4 verification. EC2/ECS
+emulation is off and Floci's Docker host points at a nonexistent socket, so the
+fixture never touches a host container daemon.
+On first start it uses Floci's public `test`/`test` pair
+only to create a registered IAM access key, creates the `uketsuke` bucket and
+writes both to `env.json` (mode 0600) in the state directory. Each start checks
+that key against the persisted bucket. It refuses an occupied port, never
+contacts AWS and stops the emulator on exit.
 
 ```nu
-mix test
+open /tmp/uketsuke-floci/env.json | load-env
+mix test --include s3
 node --test client/sign.test.mjs client/smoke.test.mjs
+nix build .#checks.x86_64-linux.smoke
 ```
 
-For a persistent local experiment, copy `config.example.json` to
-`config.local.json`, supply `roster.json`, then run:
+The Node smoke runs a real signed ZIP through the server and checks S3 Bundle
+bytes, rejection paths, interrupted/stalled transfers, Receipt replay, and quota
+after restart with empty staging. The NixOS
+smoke runs the packaged release without runtime compilation, plus a separate
+`services.uketsuke` instance for loopback confinement and restart checks. It
+also restarts Floci itself and checks that the Bundle ETag, quota ledger and
+registered key survive while a wrong secret is still rejected.
+`INBOX_SERVER_COMMAND="/path/to/bin/uketsuke start"` selects the release launcher
+in the Node smoke; otherwise it uses `mix run --no-halt`.
+
+### Run and deploy
+
+Copy `config.example.json` to `config.local.json`, provide a trusted refreshed
+Key Roster and set runtime AWS credentials before starting. All JSON fields are
+required; `staging_dir` and `roster_path` resolve relative to the config file.
+Credentials come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`;
+`AWS_SESSION_TOKEN` is optional for temporary credentials and must be nonempty
+when supplied. No instance-metadata credential lookup is performed.
 
 ```nu
 $env.INBOX_CONFIG = (pwd | path join config.local.json)
 mix run --no-halt
 ```
 
-All config fields are required; paths resolve relative to the config file.
-The example's limits are trial settings, not measurements of representative
-glue reports. The roster uses metsuke’s existing roster format:
+The Key Roster format is
 `{"epoch": N, "slot": N, "pools": {"POOL_HEX": ["BLS_PUBLIC_KEY_HEX"]}}`.
-It must come from a trusted chain query, not from the uploader. No reward
-membership is consulted. This experiment has no non-BLS admission path.
+It must come from a trusted chain query, not from the Operator uploading data.
+Uketsuke neither generates the roster nor consults reward membership.
 
-### Protocol and storage boundary
+The flake exports `packages.<system>.uketsuke`, `nixosModules.uketsuke`, and
+`checks.<system>.release` / `checks.<system>.smoke`. Example module configuration:
 
-The endpoint is `PUT /v1/uploads/<32-lowercase-hex-id>`. The body is the exact
-ZIP, not multipart data; the server never extracts it. `X-Upload-Manifest` is
-standard padded base64 of the **exact signed UTF-8 JSON bytes**;
-`X-Upload-Key` is a 96-byte G2 key in lowercase hex and
-`X-Upload-Signature` is a 48-byte G1 signature in lowercase hex. Verifiers
-must not parse and reserialize JSON before verifying. The signer controls its
-encoding; the server checks the manifest's exact required field set.
+```nix
+{
+  imports = [ inputs.uketsuke.nixosModules.uketsuke ];
+  services.uketsuke = {
+    enable = true;
+    package = inputs.uketsuke.packages.x86_64-linux.uketsuke;
+    environmentFile = "/run/secrets/uketsuke-aws-env";
+    rosterFile = "/var/lib/uketsuke-roster.json";
+    settings = {
+      service = "https://uketsuke.example.org";
+      network = "leios-prototype";
+      campaign = "glue";
+      s3_bucket = "cardano-playground-metsuke";
+      s3_region = "eu-central-1";
+      s3_endpoint = "https://s3.eu-central-1.amazonaws.com";
+      s3_prefix = "uketsuke/v1/glue/";
+    };
+  };
+}
+```
+
+The module runs under DynamicUser with private staging at
+`/var/lib/uketsuke/staging`, loopback HTTP and systemd confinement. The roster
+must be readable by that identity. Keep operational credentials out of the Nix
+store. Expose the listener through an HTTPS reverse proxy with aligned header,
+body and time limits and request buffering disabled. Cardano Playground wiring
+and live AWS writes are not part of this change.
+
+### Protocol and Archive
+
+`PUT /v1/uploads/<32-lowercase-hex-id>` receives the exact ZIP, not multipart
+data; the server never extracts it. `X-Upload-Manifest` is standard padded
+base64 of the exact signed UTF-8 JSON bytes. `X-Upload-Key` is a 96-byte G2 key
+in lowercase hex; `X-Upload-Signature` is a 48-byte G1 signature in lowercase
+hex. Verification never parses and reserializes signed bytes. The Manifest
+must contain each protocol field exactly once.
 
 BLS uses minimal-signature-size with the domain tag
-`LEIOS_ARTIFACT_UPLOAD_V1_BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_`,
-distinct from telemetry and consensus. The signed manifest binds protocol,
-service, network, campaign, pool ID, submission ID, SHA-256 digest, byte count,
-display filename and Unix expiry. A filename is never a storage path.
+`LEIOS_ARTIFACT_UPLOAD_V1_BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_`, distinct
+from telemetry and consensus. The Manifest binds protocol, destination, network,
+Campaign, Pool ID, Submission ID, digest, ZIP size, display filename and expiry.
+Neither a display filename nor a Leios Key becomes a storage path.
 
-Admission verifies the roster association and signature before reading the
-body. Bounded reads hash directly into private staging files. Publication
-fsyncs the ZIP and evidence, atomically renames without replacement, and syncs
-the directories before returning 201 and a `local-fsync` receipt. The store
-process performs the rename, so cleanup after a killed upload process cannot
-overlap a rename still running in the NIF. A retry or
-`GET /v1/receipts/<id>` uses the same authentication headers and reconfirms
-durability before returning 200. Rejections close the connection instead of
-draining the supplied body. Oversized headers can be rejected by Bandit with
-431 before application-level JSON errors. A stalled body can end with a closed
-connection rather than a JSON timeout response.
+Admission reserves an in-flight slot before expensive BLS verification and
+authenticates the Key Roster association before reading the body. Bounded reads
+hash into private temporary files; a killed or disconnected owner releases its
+slot and removes staging. A failed removal is logged as `staging cleanup
+failed` and left for the next start, which clears staging; it never fails the
+request or other uploads. The body deadline ends after the ZIP is verified;
+S3 operations have their own configured timeout.
 
-The archive is `<storage_dir>/archive/<id>/`, containing `report.zip`,
-`manifest.json`, `attestation.json`, the accepted `roster.json` and
-`receipt.json`. Developer retrieval is through these local files, not a public
-download API. Every startup syncs the storage directories' entries, removes
-owned incomplete staging entries and reconstructs quota accounting from
-completed archives. Run only one instance per storage
-directory; do not modify an archive behind a running server.
+The Archive layout is:
 
-This is an ergonomics experiment, not a public deployment configuration. It
-binds only 127.0.0.1; remote use requires an HTTPS reverse proxy with aligned
-body/header/time limits and streaming request handling. The configured total
-quota counts ZIP bytes, not evidence/filesystem overhead; use a bounded volume
-as well. Filesystem sync stalls during publication are not bounded by the
-upload-body deadline. No S3 replication or power-loss fault injection
-was exercised. Roster expiry measures local file mtime, not chain freshness;
-replacing it with old chain data does not prove current registration. Unlike
-metsuke's last-known-good behavior, this prototype refuses stale roster files.
+```text
+<s3_prefix>quota.json
+<s3_prefix>submissions/<submission_id>.tar
+  report.zip
+  manifest.json
+  attestation.json
+  receipt.json
+```
 
+Each uncompressed USTAR Bundle retains the untouched ZIP, exact signed
+Manifest, Receipt, and an attestation with the signing key, signature and the
+`roster_epoch`/`roster_slot` of the Key Roster snapshot that authorized the key.
+The roster itself is not copied: registrations at that point are chain history
+(db-sync, explorer). The USTAR entry limit is 8,589,934,591 bytes; Config
+rejects a larger `max_file_bytes`. Use a unique prefix for each inbox; prefixes
+must be safe relative paths ending in `/` and cannot sit under Metsuke telemetry
+`v1/`. Pool attribution is recorded inside the Bundle, not inferred from an
+object name or a pool ticker. Sharing a bucket does not integrate Metsuke
+readers.
+
+S3 publication uses create-only PUT. A new accepted Submission returns 201
+with `durability: "s3"`; retries and `GET /v1/receipts/<id>` authenticate a
+currently registered key, validate the stored Bundle and return its original
+Receipt with 200. Different immutable metadata gets 409. S3 failure never
+earns a Receipt. There is no local completed-Archive index or durable server
+queue; clearing staging does not lose accepted Submissions.
+
+`quota.json` is a versioned, conditional-update ledger of immutable identities
+and original Receipts. It charges signed ZIP bytes before attempting Bundle
+publication. Concurrent updates use ETags; contention is bounded by
+`s3_timeout_ms`. A failed or uncertain publication retains its reservation:
+absence on a later HEAD cannot prove an earlier timed-out PUT will not land.
+Retry the same ID and immutable metadata to recover the held capacity. Holds
+are not automatically reclaimed. Recovering an existing Bundle only reads the
+ledger: a Bundle without its reservation, or a missing ledger, fails as
+`storage_failed` rather than being charged anew. Quota excludes Evidence, tar
+padding and S3 object versions; provision storage and staging volume limits
+separately.
+
+Run one server per staging directory and use atomic-condition-capable S3.
+Do not modify Bundles or the ledger behind the server. The server's IAM
+principal needs `s3:GetObject` (also used for HEAD) and `s3:PutObject` on
+`<s3_prefix>*`, plus `s3:ListBucket` on the bucket limited to that prefix:
+without ListBucket, S3 answers 403 instead of 404 for missing keys, and every
+new Submission fails as `storage_failed`. SSE-KMS buckets also need
+`kms:GenerateDataKey` and `kms:Decrypt` on the bucket key. No Developer
+download route is added.
+Roster freshness measures local mtime, not chain freshness; replacing a file
+with old chain data does not make its registrations current.

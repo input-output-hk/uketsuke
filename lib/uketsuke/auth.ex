@@ -1,16 +1,19 @@
 defmodule Uketsuke.Auth do
   import Plug.Conn, only: [get_req_header: 2]
-
-  @fields ~w(protocol service network campaign pool_id submission_id file_hash file_size filename expires_at)
+  alias Uketsuke.{Error, Manifest, Native}
+  require Logger
 
   def parse!(conn, id, config) do
-    require!(hex?(id, 32), 400, "invalid_id", "submission id must be 32 lowercase hex characters")
-    encoded = header!(conn, "x-upload-manifest")
-    max_encoded = 4 * div(config["max_manifest_bytes"] + 2, 3)
+    Error.require!(
+      Manifest.hex?(id, 32),
+      "invalid_id",
+      "submission id must be 32 lowercase hex characters"
+    )
 
-    require!(
-      byte_size(encoded) <= max_encoded,
-      413,
+    encoded = header!(conn, "x-upload-manifest")
+
+    Error.require!(
+      byte_size(encoded) <= config.max_encoded_manifest_bytes,
       "manifest_too_large",
       "manifest exceeds configured limit"
     )
@@ -18,39 +21,28 @@ defmodule Uketsuke.Auth do
     bytes =
       case Base.decode64(encoded) do
         {:ok, bytes} -> bytes
-        :error -> fail!(400, "invalid_manifest", "manifest must use standard padded base64")
+        :error -> Error.raise!("invalid_manifest", "manifest must use standard padded base64")
       end
 
-    require!(
+    Error.require!(
       Base.encode64(bytes) == encoded,
-      400,
       "invalid_manifest",
       "manifest must use standard padded base64"
     )
 
-    require!(
-      byte_size(bytes) <= config["max_manifest_bytes"],
-      413,
-      "manifest_too_large",
-      "manifest exceeds configured limit"
-    )
-
-    manifest = decode_manifest!(bytes)
-    validate_manifest!(manifest, id, config)
+    manifest = Manifest.decode!(bytes, id, config, System.system_time(:second))
     key = header!(conn, "x-upload-key")
     signature = header!(conn, "x-upload-signature")
 
-    require!(
-      hex?(key, 192),
-      400,
+    Error.require!(
+      Manifest.hex?(key, 192),
       "invalid_key",
       "public key must be 192 lowercase hex characters"
     )
 
-    require!(
-      hex?(signature, 96),
-      400,
-      "invalid_signature",
+    Error.require!(
+      Manifest.hex?(signature, 96),
+      "invalid_signature_encoding",
       "signature must be 96 lowercase hex characters"
     )
 
@@ -59,137 +51,43 @@ defmodule Uketsuke.Auth do
 
   def authorize!(auth, config) do
     roster_bytes = read_roster!(config)
-    roster = decode!(roster_bytes, 503, "roster_unavailable")
+    roster = decode!(roster_bytes, "roster_unavailable")
     validate_roster!(roster)
-    keys = Map.get(roster["pools"], auth.manifest["pool_id"], [])
+    pool = auth.manifest.fields["pool_id"]
+    keys = Map.get(roster["pools"], pool, [])
 
-    require!(
+    Error.require!(
       auth.key in keys,
-      403,
       "key_not_registered",
       "key is not registered for this pool in the current roster"
     )
 
-    case Uketsuke.Native.verify(
+    case Native.verify(
            Base.decode16!(auth.key, case: :lower),
            Base.decode16!(auth.signature, case: :lower),
            auth.bytes
          ) do
       :verified ->
-        Map.put(auth, :roster_bytes, roster_bytes)
+        Map.put(auth, :roster, %{epoch: roster["epoch"], slot: roster["slot"]})
 
       {:rejected, _reason} ->
-        fail!(401, "invalid_signature", "BLS signature verification failed")
+        Error.raise!("invalid_signature", "BLS signature verification failed")
 
       {:invalid_key, reason} ->
-        require Logger
-        Logger.error("roster key for pool #{auth.manifest["pool_id"]} is invalid: #{reason}")
-        fail!(503, "verifier_unavailable", "signature verifier is unavailable")
+        Logger.error("roster key for pool #{pool} is invalid: #{reason}")
+        Error.raise!("verifier_unavailable", "signature verifier is unavailable")
     end
   end
-
-  def immutable(manifest), do: Map.delete(manifest, "expires_at")
-
-  def hex?(value, size) do
-    is_binary(value) and byte_size(value) == size and Regex.match?(~r/\A[0-9a-f]+\z/, value)
-  end
-
-  def require!(true, _status, _code, _message), do: :ok
-  def require!(false, status, code, message), do: fail!(status, code, message)
-  def fail!(status, code, message), do: throw({:http_error, status, code, message})
 
   defp header!(conn, name) do
     case get_req_header(conn, name) do
       [value] -> value
-      _ -> fail!(400, "missing_header", "exactly one #{name} header is required")
+      _ -> Error.raise!("missing_header", "exactly one #{name} header is required")
     end
   end
 
-  defp validate_manifest!(manifest, id, config) do
-    require!(
-      manifest["protocol"] == "leios-artifact-upload/v1",
-      400,
-      "wrong_protocol",
-      "unsupported manifest protocol"
-    )
-
-    Enum.each(~w(service network campaign), fn field ->
-      require!(
-        manifest[field] == config[field],
-        403,
-        "wrong_#{field}",
-        "manifest #{field} does not match this inbox"
-      )
-    end)
-
-    require!(
-      manifest["submission_id"] == id,
-      400,
-      "id_mismatch",
-      "manifest submission_id does not match request path"
-    )
-
-    require!(
-      hex?(manifest["pool_id"], 56),
-      400,
-      "invalid_pool",
-      "pool_id must be 56 lowercase hex characters"
-    )
-
-    require!(
-      hex?(manifest["file_hash"], 64),
-      400,
-      "invalid_hash",
-      "file_hash must be 64 lowercase hex characters"
-    )
-
-    size = manifest["file_size"]
-
-    require!(
-      is_integer(size) and size > 0,
-      400,
-      "invalid_size",
-      "file_size must be a positive integer"
-    )
-
-    require!(
-      size <= config["max_file_bytes"],
-      413,
-      "file_too_large",
-      "file_size exceeds configured limit"
-    )
-
-    filename = manifest["filename"]
-
-    require!(
-      is_binary(filename) and String.valid?(filename) and String.trim(filename) != "",
-      400,
-      "invalid_filename",
-      "filename must be a nonempty UTF-8 display name"
-    )
-
-    expires = manifest["expires_at"]
-    now = System.system_time(:second)
-
-    require!(
-      is_integer(expires),
-      400,
-      "invalid_expiry",
-      "expires_at must be an integer Unix timestamp"
-    )
-
-    require!(expires > now, 401, "expired_manifest", "manifest has expired")
-
-    require!(
-      expires <= now + config["max_lifetime_secs"],
-      400,
-      "expiry_too_far",
-      "manifest lifetime exceeds configured limit"
-    )
-  end
-
   defp read_roster!(config) do
-    case File.open(config["roster_path"], [:read, :binary]) do
+    case File.open(config.roster_path, [:read, :binary]) do
       {:ok, file} ->
         try do
           # Stat the opened snapshot, not a path that a roster rename can replace.
@@ -197,23 +95,28 @@ defmodule Uketsuke.Auth do
                stat = File.Stat.from_record(record),
                true <- stat.type == :regular,
                age = System.system_time(:second) - stat.mtime,
-               true <- age >= 0 and age <= config["roster_max_age_secs"],
+               true <- age >= 0 and age <= config.roster_max_age_secs,
                bytes when is_binary(bytes) <- IO.binread(file, :eof) do
             bytes
           else
             _ ->
-              fail!(
-                503,
+              Error.raise!(
                 "roster_unavailable",
                 "roster is stale, unreadable, or not a regular file"
               )
           end
         after
-          File.close(file)
+          case File.close(file) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Error.raise!("roster_unavailable", "cannot close roster: #{inspect(reason)}")
+          end
         end
 
       {:error, _reason} ->
-        fail!(503, "roster_unavailable", "roster could not be opened")
+        Error.raise!("roster_unavailable", "roster could not be opened")
     end
   end
 
@@ -223,36 +126,16 @@ defmodule Uketsuke.Auth do
         is_integer(roster["epoch"]) and roster["epoch"] >= 0 and
         is_integer(roster["slot"]) and roster["slot"] >= 0 and is_map(roster["pools"]) and
         Enum.all?(roster["pools"], fn {pool, keys} ->
-          hex?(pool, 56) and is_list(keys) and Enum.all?(keys, &hex?(&1, 192))
+          Manifest.hex?(pool, 56) and is_list(keys) and Enum.all?(keys, &Manifest.hex?(&1, 192))
         end)
 
-    require!(valid, 503, "roster_unavailable", "roster has an invalid schema")
+    Error.require!(valid, "roster_unavailable", "roster has an invalid schema")
   end
 
-  defp decode!(bytes, status, code) do
+  defp decode!(bytes, code) do
     case Jason.decode(bytes) do
       {:ok, value} -> value
-      {:error, _reason} -> fail!(status, code, "invalid UTF-8 JSON")
-    end
-  end
-
-  defp decode_manifest!(bytes) do
-    case Jason.decode(bytes, objects: :ordered_objects) do
-      {:ok, %Jason.OrderedObject{values: members}} ->
-        require!(
-          Enum.sort(Enum.map(members, &elem(&1, 0))) == Enum.sort(@fields),
-          400,
-          "invalid_manifest",
-          "manifest must contain each protocol field exactly once"
-        )
-
-        Map.new(members)
-
-      {:ok, _value} ->
-        fail!(400, "invalid_manifest", "manifest must be a JSON object")
-
-      {:error, _reason} ->
-        fail!(400, "invalid_manifest", "invalid UTF-8 JSON")
+      {:error, _reason} -> Error.raise!(code, "invalid UTF-8 JSON")
     end
   end
 end

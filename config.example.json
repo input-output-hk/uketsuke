@@ -3,7 +3,7 @@
   "service": "http://127.0.0.1:4100",
   "network": "leios-prototype",
   "campaign": "glue",
-  "storage_dir": "./var/inbox",
+  "staging_dir": "./var/staging",
   "roster_path": "./roster.json",
   "max_file_bytes": 104857600,
   "max_total_bytes": 1073741824,
@@ -11,5 +11,10 @@
   "max_manifest_bytes": 8192,
   "max_lifetime_secs": 900,
   "upload_timeout_ms": 120000,
-  "roster_max_age_secs": 3600
+  "roster_max_age_secs": 3600,
+  "s3_bucket": "cardano-playground-metsuke",
+  "s3_region": "eu-central-1",
+  "s3_endpoint": "https://s3.eu-central-1.amazonaws.com",
+  "s3_prefix": "uketsuke/v1/glue/",
+  "s3_timeout_ms": 30000
 }
