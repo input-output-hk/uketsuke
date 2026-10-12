@@ -54,6 +54,7 @@ pkgs.stdenvNoCC.mkDerivation {
   passthru.platform = "${arch}-linux";
   meta = {
     description = "Offline BLS signer producing curl upload requests for Uketsuke";
+    license = lib.licenses.asl20;
     platforms = lib.platforms.linux;
     mainProgram = "uketsuke-sign";
   };

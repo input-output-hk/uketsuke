@@ -241,7 +241,7 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
   await start();
   const sign = out => JSON.parse(execFileSync(signer, ['--key', join(dir, 'bls.skey'),
     '--file', reportPath, '--pool', pool, '--campaign', join(dir, 'campaign.json'), '--out', join(dir, out)], { encoding: 'utf8' }));
-  const curl = (out, config) => spawnSync('curl', ['-K', join(dir, out, config)], { encoding: 'utf8' });
+  const curl = (out, config) => spawnSync('curl', ['-q', '-K', join(dir, out, config)], { encoding: 'utf8' });
   const receiptOf = (out, config) => {
     const result = curl(out, config);
     assert.equal(result.status, 0, result.stderr);

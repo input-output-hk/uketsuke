@@ -57,6 +57,7 @@ pkgs.beamMinimalPackages.mixRelease {
   '';
   meta = {
     description = "Signed Leios report inbox with immutable S3 archives";
+    license = lib.licenses.asl20;
     platforms = lib.platforms.linux;
     mainProgram = "uketsuke";
   };

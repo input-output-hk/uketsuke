@@ -12,8 +12,8 @@ const usage =
     \\A fresh random submission ID is used unless --id is supplied for recovery.
     \\Output: manifest.json (the exact signed bytes) and the curl configs
     \\upload.curl and receipt.curl (report path, public key, signature).
-    \\Upload (curl 7.76.0 or newer): curl -K request/upload.curl
-    \\Recover receipt: curl -K request/receipt.curl
+    \\Upload (curl 7.76.0 or newer): curl -q -K request/upload.curl
+    \\Recover receipt: curl -q -K request/receipt.curl
     \\Never use a cold key. No private key is included in the generated files.
     \\
 ;
