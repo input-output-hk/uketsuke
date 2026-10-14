@@ -4,9 +4,10 @@ Uketsuke (受付, “reception desk”) collects BLS-signed ZIP reports from
 registered pool keys and stores each report, signed metadata, and receipt in
 an immutable S3 archive. Signing happens locally; private keys are never sent.
 
-**Prototype: use disposable BLS keys only.** The packaged x86-64 workflow is
-smoke-tested against Floci, not a production AWS/HTTPS deployment. Linux
-x86-64 and aarch64 builds are available; aarch64 execution is not smoke-tested.
+Uketsuke runs at <https://uketsuke-leios.play.dev.cardano.org> for the Leios
+testnet `leios-164`. Sign only with the Leios key registered for your pool on
+that testnet, never a cold key. Static signer releases exist for Linux x86-64
+and aarch64; aarch64 execution is not smoke-tested.
 
 ## Upload a report
 

@@ -30,6 +30,10 @@ let
         };
       }
   ) entries;
+  # mix.exs is the one place the server version is written.
+  version = builtins.head (
+    builtins.match ''.*version: "([^"]+)".*'' (builtins.readFile ../mix.exs)
+  );
   deps = pkgs.runCommand "uketsuke-pinned-mix-deps" { } (
     ''
       mkdir -p "$out"
@@ -43,8 +47,7 @@ let
 in
 pkgs.beamMinimalPackages.mixRelease {
   pname = "uketsuke";
-  version = "0.1.0";
-  inherit src;
+  inherit version src;
   mixFodDeps = deps;
   env = {
     ZIG_EXECUTABLE_PATH = lib.getExe pkgs.zig;

@@ -1,6 +1,6 @@
 .{
     .name = .uketsuke_sign,
-    .version = "0.1.0",
+    .version = "1.0.0",
     .fingerprint = 0xd721ae61893a6fdb, // Changing this has security and trust implications.
     // zigler pins the server's NIF to the same Zig release.
     .minimum_zig_version = "0.16.0",
