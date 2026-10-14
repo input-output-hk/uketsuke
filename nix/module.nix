@@ -50,6 +50,10 @@ in
       s3_endpoint = stringSetting "S3 API endpoint.";
       s3_prefix = stringSetting "Unique per-inbox archive prefix ending in '/', separate from Metsuke v1/.";
       port = positiveSetting 4000 "Loopback listener port.";
+      metrics_port = mkOption {
+        type = types.ints.between 1 65535;
+        description = "Loopback Prometheus port serving GET /metrics. Never proxy it publicly; it must differ from port.";
+      };
       max_file_bytes = positiveSetting (100 * 1024 * 1024) "Maximum signed ZIP size.";
       max_total_bytes = positiveSetting (
         10 * 1024 * 1024 * 1024
@@ -75,6 +79,10 @@ in
       {
         assertion = cfg.settings.port <= 65535;
         message = "services.uketsuke.settings.port must be <= 65535";
+      }
+      {
+        assertion = cfg.settings.metrics_port != cfg.settings.port;
+        message = "services.uketsuke.settings.metrics_port must differ from port";
       }
     ];
     systemd.services.uketsuke = {

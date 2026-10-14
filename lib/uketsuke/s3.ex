@@ -1,5 +1,5 @@
 defmodule Uketsuke.S3 do
-  alias Uketsuke.Error
+  alias Uketsuke.{Error, Metrics}
 
   @http Uketsuke.S3.HTTP
   @chunk_bytes 64 * 1024
@@ -255,11 +255,25 @@ defmodule Uketsuke.S3 do
     initial = %{status: nil, headers: [], chunks: [], bytes: 0, error_bytes: 0}
     opts = [pool_timeout: s3.timeout, receive_timeout: s3.timeout, request_timeout: s3.timeout]
 
-    case Finch.stream_while(request, @http, initial, &consume!(&1, &2, sink), opts) do
+    started = System.monotonic_time()
+
+    result =
+      try do
+        Finch.stream_while(request, @http, initial, &consume!(&1, &2, sink), opts)
+      catch
+        kind, reason ->
+          Metrics.s3(method, "error", System.monotonic_time() - started)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    case result do
       {:ok, response} ->
+        Metrics.s3(method, response.status, System.monotonic_time() - started)
         Map.put(response, :body, response.chunks |> Enum.reverse() |> IO.iodata_to_binary())
 
       {:error, reason, _response} ->
+        Metrics.s3(method, "error", System.monotonic_time() - started)
+
         Error.raise!(
           "storage_failed",
           "S3 #{method} #{key}: #{inspect(reason)}; write outcome may be uncertain"
@@ -340,6 +354,8 @@ defmodule Uketsuke.S3 do
   end
 
   defp operation!(s3, method, key, fun) do
+    op = Map.fetch!(%{"HEAD" => :head, "GET" => :get, "PUT" => :put}, method)
+    started = System.monotonic_time()
     # Link cancellation to the caller; killing an intake also closes its HTTP/file work.
     task =
       Task.async(fn ->
@@ -372,6 +388,11 @@ defmodule Uketsuke.S3 do
         )
 
       result ->
+        # nil: the deadline killed the worker, usually before it recorded its
+        # request. A kill after recording counts that request twice; accepted.
+        status = if result == nil, do: "timeout", else: "error"
+        Metrics.s3(op, status, System.monotonic_time() - started)
+
         Error.raise!(
           "storage_failed",
           "S3 #{method} #{key}: operation deadline or worker failure #{inspect(result)}; write outcome may be uncertain"

@@ -1,13 +1,16 @@
 defmodule Uketsuke.Intake do
   import Plug.Conn, only: [get_req_header: 2, read_body: 2]
 
-  alias Uketsuke.{Auth, Bundle, Error, Manifest, Quota, S3, Store}
+  alias Uketsuke.{Auth, Bundle, Error, Manifest, Quota, RequestLog, S3, Store}
 
-  def request!(conn, id, mode, config, s3) when mode in [:upload, :receipt] do
+  # auth comes from Auth.parse!, which binds the path id to the Manifest's submission_id.
+  def request!(conn, auth, %RequestLog{route: mode} = log, config, s3) do
     deadline = now() + config.upload_timeout_ms
-    auth = Auth.parse!(conn, id, config)
+    id = auth.manifest.fields["submission_id"]
 
-    Store.with_slot!(id, deadline, fn token, stage ->
+    on_kill = fn -> RequestLog.finish(log, {:rejected, "upload_timeout"}, nil) end
+
+    Store.with_slot!(id, deadline, on_kill, fn token, stage ->
       auth = Auth.authorize!(auth, config)
       key = object_key(config, id)
 

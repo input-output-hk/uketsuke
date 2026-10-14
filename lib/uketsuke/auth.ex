@@ -1,6 +1,6 @@
 defmodule Uketsuke.Auth do
   import Plug.Conn, only: [get_req_header: 2]
-  alias Uketsuke.{Error, Manifest, Native}
+  alias Uketsuke.{Error, Manifest, Native, Roster}
   require Logger
 
   def parse!(conn, id, config) do
@@ -50,11 +50,9 @@ defmodule Uketsuke.Auth do
   end
 
   def authorize!(auth, config) do
-    roster_bytes = read_roster!(config)
-    roster = decode!(roster_bytes, "roster_unavailable")
-    validate_roster!(roster)
+    roster = Roster.read!(config, :parse)
     pool = auth.manifest.fields["pool_id"]
-    keys = Map.get(roster["pools"], pool, [])
+    keys = Map.get(roster.pools, pool, [])
 
     Error.require!(
       auth.key in keys,
@@ -68,7 +66,7 @@ defmodule Uketsuke.Auth do
            auth.bytes
          ) do
       :verified ->
-        Map.put(auth, :roster, %{epoch: roster["epoch"], slot: roster["slot"]})
+        Map.put(auth, :roster, %{epoch: roster.epoch, slot: roster.slot})
 
       {:rejected, _reason} ->
         Error.raise!("invalid_signature", "BLS signature verification failed")
@@ -83,59 +81,6 @@ defmodule Uketsuke.Auth do
     case get_req_header(conn, name) do
       [value] -> value
       _ -> Error.raise!("missing_header", "exactly one #{name} header is required")
-    end
-  end
-
-  defp read_roster!(config) do
-    case File.open(config.roster_path, [:read, :binary]) do
-      {:ok, file} ->
-        try do
-          # Stat the opened snapshot, not a path that a roster rename can replace.
-          with {:ok, record} <- :file.read_file_info(file, time: :posix),
-               stat = File.Stat.from_record(record),
-               true <- stat.type == :regular,
-               age = System.system_time(:second) - stat.mtime,
-               true <- age >= 0 and age <= config.roster_max_age_secs,
-               bytes when is_binary(bytes) <- IO.binread(file, :eof) do
-            bytes
-          else
-            _ ->
-              Error.raise!(
-                "roster_unavailable",
-                "roster is stale, unreadable, or not a regular file"
-              )
-          end
-        after
-          case File.close(file) do
-            :ok ->
-              :ok
-
-            {:error, reason} ->
-              Error.raise!("roster_unavailable", "cannot close roster: #{inspect(reason)}")
-          end
-        end
-
-      {:error, _reason} ->
-        Error.raise!("roster_unavailable", "roster could not be opened")
-    end
-  end
-
-  defp validate_roster!(roster) do
-    valid =
-      is_map(roster) and Enum.sort(Map.keys(roster)) == ~w(epoch pools slot) and
-        is_integer(roster["epoch"]) and roster["epoch"] >= 0 and
-        is_integer(roster["slot"]) and roster["slot"] >= 0 and is_map(roster["pools"]) and
-        Enum.all?(roster["pools"], fn {pool, keys} ->
-          Manifest.hex?(pool, 56) and is_list(keys) and Enum.all?(keys, &Manifest.hex?(&1, 192))
-        end)
-
-    Error.require!(valid, "roster_unavailable", "roster has an invalid schema")
-  end
-
-  defp decode!(bytes, code) do
-    case Jason.decode(bytes) do
-      {:ok, value} -> value
-      {:error, _reason} -> Error.raise!(code, "invalid UTF-8 JSON")
     end
   end
 end

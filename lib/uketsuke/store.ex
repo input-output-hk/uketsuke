@@ -3,12 +3,13 @@ defmodule Uketsuke.Store do
 
   require Logger
 
-  alias Uketsuke.{Error, Manifest}
+  alias Uketsuke.{Error, Manifest, Metrics}
 
   def start_link(config), do: GenServer.start_link(__MODULE__, config, name: __MODULE__)
 
-  def with_slot!(id, deadline, fun) do
-    case GenServer.call(__MODULE__, {:reserve, id, deadline}, :infinity) do
+  # on_kill runs, unlinked, if the deadline kills the owner before body_complete!.
+  def with_slot!(id, deadline, on_kill, fun) when is_function(on_kill, 0) do
+    case GenServer.call(__MODULE__, {:reserve, id, deadline, on_kill}, :infinity) do
       {:ok, token, stage} ->
         try do
           create_stage!(stage)
@@ -55,11 +56,12 @@ defmodule Uketsuke.Store do
       File.rm_rf!(Path.join(config.staging_dir, name))
     end)
 
+    Metrics.inflight(0)
     {:ok, %{config: config, active: %{}}}
   end
 
   @impl true
-  def handle_call({:reserve, id, deadline}, {pid, _}, state) do
+  def handle_call({:reserve, id, deadline, on_kill}, {pid, _}, state) do
     cond do
       Enum.any?(state.active, fn {_, item} -> item.id == id end) ->
         {:reply, {:error, "upload_in_progress", "submission id is already in flight"}, state}
@@ -75,8 +77,10 @@ defmodule Uketsuke.Store do
         random = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
         stage = Path.join(state.config.staging_dir, id <> "-" <> random)
         # The request process creates the directory; release and DOWN remove it.
-        item = %{id: id, pid: pid, monitor: monitor, timer: timer, stage: stage}
-        {:reply, {:ok, token, stage}, put_in(state.active[token], item)}
+        item = %{id: id, pid: pid, monitor: monitor, timer: timer, stage: stage, on_kill: on_kill}
+        active = Map.put(state.active, token, item)
+        Metrics.inflight(map_size(active))
+        {:reply, {:ok, token, stage}, %{state | active: active}}
     end
   end
 
@@ -94,8 +98,13 @@ defmodule Uketsuke.Store do
   @impl true
   def handle_info({:deadline, token}, state) do
     case Map.get(state.active, token) do
-      %{timer: timer, pid: pid} when not is_nil(timer) -> Process.exit(pid, :kill)
-      _ -> :ok
+      %{timer: timer, pid: pid, on_kill: on_kill} when not is_nil(timer) ->
+        Process.exit(pid, :kill)
+        # Unlinked: the callback must neither stall admission nor crash the Store.
+        spawn(on_kill)
+
+      _ ->
+        :ok
     end
 
     {:noreply, state}
@@ -117,6 +126,7 @@ defmodule Uketsuke.Store do
 
   defp drop(state, token) do
     {item, active} = Map.pop!(state.active, token)
+    Metrics.inflight(map_size(active))
     cancel_timer(item)
     Process.demonitor(item.monitor, [:flush])
 
@@ -128,7 +138,12 @@ defmodule Uketsuke.Store do
         :ok
 
       {:error, reason, path} ->
-        Logger.error("staging cleanup failed for #{item.stage} at #{path}: #{inspect(reason)}")
+        Logger.error(%{
+          event: "staging_cleanup_failed",
+          stage: item.stage,
+          path: path,
+          reason: inspect(reason)
+        })
     end
 
     %{state | active: active}

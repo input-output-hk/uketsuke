@@ -1,6 +1,6 @@
 defmodule Uketsuke.S3QuotaTest do
   use ExUnit.Case, async: false
-  alias Uketsuke.{Error, Manifest, Quota, S3}
+  alias Uketsuke.{Error, Manifest, Metrics, Quota, S3}
 
   @moduletag :s3
 
@@ -9,6 +9,7 @@ defmodule Uketsuke.S3QuotaTest do
     {:ok, _} = Application.ensure_all_started(:aws_signature)
     config = config()
     start_supervised!(S3.child_spec(config))
+    start_supervised!(Metrics)
     :ok
   end
 

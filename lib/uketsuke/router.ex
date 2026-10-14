@@ -2,7 +2,7 @@ defmodule Uketsuke.Router do
   @behaviour Plug
   import Plug.Conn
   require Logger
-  alias Uketsuke.{Error, Intake}
+  alias Uketsuke.{Auth, Error, Intake, Metrics, RequestLog, Roster}
 
   @statuses %{
     "invalid_id" => 400,
@@ -51,13 +51,75 @@ defmodule Uketsuke.Router do
   def init(config), do: config
 
   @impl true
-  def call(conn, context) do
+  def call(conn, {config, _s3} = context) do
     case {conn.method, conn.path_info} do
-      {"GET", ["health"]} -> json(conn, 200, %{status: "ready"})
-      {"PUT", ["v1", "uploads", id]} -> request(conn, id, :upload, context)
-      {"GET", ["v1", "receipts", id]} -> request(conn, id, :receipt, context)
-      _ -> error(conn, 404, "not_found", "route not found")
+      {"GET", ["healthz"]} ->
+        health(conn, config)
+
+      {"PUT", ["v1", "uploads", id]} ->
+        request(conn, id, :upload, context)
+
+      {"GET", ["v1", "receipts", id]} ->
+        request(conn, id, :receipt, context)
+
+      _ ->
+        Metrics.unrouted()
+        error(conn, 404, "not_found", "route not found")
     end
+  end
+
+  defp request(conn, id, route, {config, s3}) do
+    log = RequestLog.start(route, id)
+
+    {conn, log, result, status, body} =
+      case attempt(log, fn -> Auth.parse!(conn, id, config) end) do
+        {:ok, auth} -> intake(conn, auth, RequestLog.manifest(log, auth.manifest), config, s3)
+        {:rejected, code, status, body} -> {conn, log, {:rejected, code}, status, body}
+      end
+
+    respond(conn, log, result, status, body)
+  end
+
+  defp intake(conn, auth, log, config, s3) do
+    case attempt(log, fn -> Intake.request!(conn, auth, log, config, s3) end) do
+      {:ok, {conn, :created, receipt}} -> {conn, log, :accepted, 201, receipt}
+      {:ok, {conn, :existing, receipt}} -> {conn, log, :recovered, 200, receipt}
+      {:rejected, code, status, body} -> {conn, log, {:rejected, code}, status, body}
+    end
+  end
+
+  # The single send: the outcome is known even if the client leaves before it.
+  defp respond(conn, log, result, status, body) do
+    conn = json(conn, status, body)
+    RequestLog.finish(log, result, status)
+    conn
+  rescue
+    exception in Bandit.TransportError ->
+      RequestLog.finish(log, result, nil)
+      reraise exception, __STACKTRACE__
+  end
+
+  # No S3 call: public probes must not drive Archive cost.
+  defp health(conn, config) do
+    roster = Roster.read!(config, :cached)
+
+    json(conn, 200, %{
+      status: "ready",
+      roster: %{
+        epoch: roster.epoch,
+        slot: roster.slot,
+        pools: map_size(roster.pools),
+        age_secs: Roster.age_secs(roster)
+      }
+    })
+  rescue
+    error in Error -> json(conn, 503, %{status: "unavailable", error: %{code: error.code}})
+  end
+
+  # The one place a request stage can fail. A rejection becomes a response for
+  # respond/5; a disconnect or crash finishes the log here, since respond never runs.
+  defp attempt(log, fun) do
+    {:ok, fun.()}
   rescue
     exception in Error ->
       status = Map.fetch!(@statuses, exception.code)
@@ -65,7 +127,12 @@ defmodule Uketsuke.Router do
       message =
         case Map.fetch(@private_messages, exception.code) do
           {:ok, public} ->
-            Logger.error("#{exception.code}: #{Exception.message(exception)}")
+            Logger.error(%{
+              event: "private_error",
+              code: exception.code,
+              message: Exception.message(exception)
+            })
+
             public
 
           :error ->
@@ -77,32 +144,34 @@ defmodule Uketsuke.Router do
           do: "invalid_signature",
           else: exception.code
 
-      error(conn, status, code, message)
+      rejected(code, status, message)
 
     exception in File.Error ->
-      Logger.error("inbox staging failed: #{Exception.message(exception)}")
-      error(conn, 500, "storage_failed", "artifact storage failed")
+      Logger.error(%{
+        event: "private_error",
+        code: "storage_failed",
+        message: "inbox staging failed: " <> Exception.message(exception)
+      })
+
+      rejected("storage_failed", 500, "artifact storage failed")
 
     exception in Bandit.HTTPError ->
-      error(
-        conn,
-        Plug.Conn.Status.code(exception.plug_status),
-        "body_read_failed",
-        "request body could not be read"
-      )
+      status = Plug.Conn.Status.code(exception.plug_status)
+      rejected("body_read_failed", status, "request body could not be read")
+
+    # The client is gone, so there is no one to answer; Bandit closes quietly.
+    exception in Bandit.TransportError ->
+      RequestLog.finish(log, {:rejected, "client_disconnected"}, nil)
+      reraise exception, __STACKTRACE__
+  catch
+    # A server fault: count and log it, then let Bandit answer 500 and log the crash.
+    kind, reason ->
+      RequestLog.finish(log, {:rejected, "internal_error"}, nil)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  defp request(conn, id, mode, {config, s3}) do
-    {conn, disposition, receipt} = Intake.request!(conn, id, mode, config, s3)
-
-    status =
-      case disposition do
-        :created -> 201
-        :existing -> 200
-      end
-
-    json(conn, status, receipt)
-  end
+  defp rejected(code, status, message),
+    do: {:rejected, code, status, %{error: %{code: code, message: message}}}
 
   defp error(conn, status, code, message),
     do: json(conn, status, %{error: %{code: code, message: message}})

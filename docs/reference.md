@@ -1,7 +1,8 @@
 # Reference
 
 [Quickstart](../README.md) · [Operation](#operate-the-service) ·
-[Development](#develop-and-test) · [Protocol](#protocol-and-archive)
+[Observability](#observability) · [Development](#develop-and-test) ·
+[Protocol](#protocol-and-archive)
 
 ## Upload details
 
@@ -96,6 +97,7 @@ network, campaign, bucket, region, and file paths for your service:
       s3_region = "eu-central-1";
       s3_endpoint = "https://s3.eu-central-1.amazonaws.com";
       s3_prefix = "uketsuke/reports/";
+      metrics_port = 4001;
     };
   };
 }
@@ -108,6 +110,66 @@ store. Expose the listener through an HTTPS reverse proxy with aligned header,
 body and time limits and request buffering disabled. Reverse-proxy configuration,
 roster generation/refresh, bucket provisioning, and live AWS verification are
 operator responsibilities; this repository does not provision them.
+
+## Observability
+
+`GET /healthz` on the public listener answers 200 with
+`{"status":"ready","roster":{"epoch":N,"slot":N,"pools":N,"age_secs":N}}`
+while the Key Roster is valid and within `roster_max_age_secs`, and 503 with
+`{"status":"unavailable","error":{"code":"roster_unavailable"}}` otherwise. It
+reads only the local roster, never S3, so probes cannot drive Archive cost. It
+reuses the last parse while the roster file's device, inode, mtime and size are
+unchanged, so a probe costs one `stat`; authorization always reparses. Replace
+the roster by rename, as an in-place rewrite that keeps size and mtime is
+invisible to the probe until it changes.
+
+`GET /metrics` is served only on `127.0.0.1:<metrics_port>`, a separate
+listener; do not proxy it. `metrics_port` 0 binds a free port, and the startup
+line `UKETSUKE_READY http://127.0.0.1:<port> metrics=<url>` names the bound
+ports. The NixOS module requires a fixed port. Series:
+
+| Series | Type | Labels |
+| --- | --- | --- |
+| `uketsuke_requests_total` | counter | `route` (upload, receipt, other), `outcome` (accepted, recovered, rejected), `code` (error code, rejected only; `internal_error` for a server fault, `client_disconnected` when the client dropped the connection, `not_found` for other routes) |
+| `uketsuke_request_duration_seconds` | histogram | `route` (upload, receipt) |
+| `uketsuke_accepted_bytes_total` | counter | signed ZIP bytes of newly accepted Submissions |
+| `uketsuke_inflight`, `uketsuke_inflight_max` | gauge | admitted slots now; `max_inflight` |
+| `uketsuke_quota_reserved_bytes` | gauge | reserved ZIP bytes, the largest total any ledger read or write saw |
+| `uketsuke_quota_max_bytes` | gauge | `max_total_bytes` |
+| `uketsuke_s3_requests_total` | counter | `op` (head, get, put), `status` (HTTP status; `error` without a usable response: transport failure, or a response body over its size bound; `timeout` when the deadline killed the request) |
+| `uketsuke_s3_request_duration_seconds` | histogram | `op` |
+| `uketsuke_roster_ok` | gauge | 1 when the roster is valid and fresh |
+| `uketsuke_roster_mtime_seconds`, `uketsuke_roster_epoch`, `uketsuke_roster_pools` | gauge | read at scrape; absent while the roster is invalid |
+
+Startup reads the quota ledger once in the background;
+`uketsuke_quota_reserved_bytes` stays absent until a ledger read succeeds, and
+a failed startup read is logged with `event` `quota_startup_read_failed`. Holds
+are never reclaimed, so the gauge never decreases; restart the service after
+resetting a ledger by hand. Once reserved bytes reach
+`max_total_bytes` every new upload gets `storage_quota`. Alert on
+`time() - uketsuke_roster_mtime_seconds` for roster age. No label carries a
+Pool or Submission ID.
+
+Logs are one JSON object per line
+([logger_json](https://hexdocs.pm/logger_json/7.0.4/) Basic formatter):
+`time`, `severity`, `message` and an empty `metadata`. Every finished upload or
+receipt request writes one line whose `message` is an object:
+
+```json
+{"time":"2026-10-14T12:00:00.000Z","severity":"info","metadata":{},"message":{"event":"request","route":"upload","outcome":"rejected","code":"storage_quota","status":507,"pool_id":"<56 hex>","submission_id":"<32 hex>","file_size":1234,"duration_ms":41}}
+```
+
+Loki: `{systemd_unit="uketsuke.service"} | json | message_event="request"`.
+`code` appears only on rejections and is the public error code from the
+response. `status` is absent when the request process did not answer: the
+upload deadline killed it (`upload_timeout`), the client disconnected
+(`client_disconnected`) or a server fault crashed it (`internal_error`). `submission_id` is absent unless the path ID is valid;
+`pool_id` and `file_size` are absent until the Manifest parses, and are the
+Manifest's claims, authenticated only for `accepted` and `recovered`. Manifest
+bytes, keys and signatures are never logged. Server-side failures behind a
+generic public message (`storage_failed`, `roster_unavailable`,
+`verifier_unavailable`) are logged as `{"event":"private_error","code":…,"message":…}`;
+other messages are a JSON string in `message`.
 
 ## Develop and test
 
@@ -191,8 +253,8 @@ Neither a display filename nor a BLS key becomes a storage path.
 Admission reserves an in-flight slot before expensive BLS verification and
 authenticates the Key Roster association before reading the body. Bounded reads
 hash into private temporary files; a killed or disconnected owner releases its
-slot and removes staging. A failed removal is logged as `staging cleanup
-failed` and left for the next start, which clears staging; it never fails the
+slot and removes staging. A failed removal is logged with `event`
+`staging_cleanup_failed` and left for the next start, which clears staging; it never fails the
 request or other uploads. The body deadline ends after the ZIP is verified;
 S3 operations have their own configured timeout.
 

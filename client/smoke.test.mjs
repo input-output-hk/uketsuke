@@ -119,6 +119,7 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
   const dir = await mkdtemp(join(tmpdir(), 'uketsuke-smoke-'));
   let server;
   let output = '';
+  let metricsUrl;
   t.after(async () => {
     await stop();
     await rm(dir, { recursive: true, force: true });
@@ -143,7 +144,7 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
   }), { mode: 0o600 });
   await writeFile(join(dir, 'campaign.json'), JSON.stringify(campaign));
   const config = {
-    port, service, network: campaign.network, campaign: campaign.campaign,
+    port, metrics_port: 0, service, network: campaign.network, campaign: campaign.campaign,
     staging_dir: staging, roster_path: rosterPath,
     max_file_bytes: report.length * 2, max_total_bytes: report.length * 4,
     max_inflight: 2, max_manifest_bytes: 4096, max_lifetime_secs: 3600,
@@ -188,7 +189,10 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
       server.once('error', reject);
       function capture(chunk) {
         output += chunk;
-        if (output.includes(`UKETSUKE_READY ${service}`)) {
+        const ready = output.match(/UKETSUKE_READY (\S+) metrics=(\S+)\n/);
+        if (ready) {
+          assert.equal(ready[1], service);
+          metricsUrl = ready[2];
           clearTimeout(timer);
           server.removeListener('exit', exited);
           resolve();
@@ -409,5 +413,35 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
     assert.deepEqual(await lost.json(), archiveEntry(third.submission_id).receipt);
     assert.deepEqual(archiveEntry(second.submission_id).report, report);
     assert.deepEqual(keys(), [original, retried, second, third].map(m => objectKey(m.submission_id)).sort());
+  });
+  await t.test('healthz, loopback metrics and request log lines observe the restarted server', async () => {
+    const health = await fetch(`${service}/healthz`);
+    assert.equal(health.status, 200);
+    assert.equal((await health.json()).status, 'ready');
+    assert.equal((await fetch(`${service}/metrics`)).status, 404);
+    assert.notEqual(new URL(metricsUrl).port, String(port));
+    const metrics = await (await fetch(metricsUrl)).text();
+    for (const series of [
+      'uketsuke_requests_total{route="upload",outcome="rejected",code="storage_quota"} 1',
+      'uketsuke_requests_total{route="receipt",outcome="recovered"} 2',
+      `uketsuke_quota_reserved_bytes ${config.max_total_bytes}`,
+      `uketsuke_quota_max_bytes ${config.max_total_bytes}`,
+      'uketsuke_s3_requests_total{op="head",status="200"} 2',
+      'uketsuke_roster_ok 1',
+      'uketsuke_inflight 0',
+    ]) assert.ok(metrics.includes(`${series}\n`), `missing ${series}\n${metrics}`);
+    const lines = output.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line));
+    const requests = lines.filter(line => line.message?.event === 'request').map(line => line.message);
+    const timed = ({ duration_ms, ...rest }) => { assert.ok(Number.isInteger(duration_ms)); return rest; };
+    assert.deepEqual(timed(requests.find(r => r.submission_id === original.submission_id)), {
+      event: 'request', route: 'receipt', outcome: 'recovered', status: 200,
+      pool_id: pool, submission_id: original.submission_id, file_size: report.length,
+    });
+    const refused = requests.find(r => r.code === 'storage_quota');
+    assert.deepEqual(timed(refused), {
+      event: 'request', route: 'upload', outcome: 'rejected', code: 'storage_quota', status: 507,
+      pool_id: pool, submission_id: refused.submission_id, file_size: report.length,
+    });
+    assert.ok(!output.includes(key), 'a public key reached the log');
   });
 });

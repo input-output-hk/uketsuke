@@ -22,6 +22,7 @@ defmodule Uketsuke.MixProject do
       {:bandit, "== 1.12.5"},
       {:plug, "== 1.20.3"},
       {:jason, "== 1.4.4"},
+      {:logger_json, "== 7.0.4"},
       {:finch, "== 0.24.0"},
       {:aws_signature, "== 0.4.3"},
       {:zigler, "== 0.16.0", runtime: false}

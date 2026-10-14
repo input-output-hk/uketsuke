@@ -1,5 +1,5 @@
 defmodule Uketsuke.Quota do
-  alias Uketsuke.{Error, Manifest, S3}
+  alias Uketsuke.{Error, Manifest, Metrics, S3}
 
   @immutable_fields ~w(protocol service network campaign pool_id submission_id file_hash file_size filename)
 
@@ -50,10 +50,7 @@ defmodule Uketsuke.Quota do
         entry["receipt"]
 
       :error ->
-        used =
-          Enum.reduce(ledger["reservations"], 0, fn {_id, entry}, sum ->
-            sum + entry["immutable"]["file_size"]
-          end)
+        used = reserved_bytes(ledger)
 
         Error.require!(
           used + immutable["file_size"] <= config.max_total_bytes,
@@ -72,8 +69,12 @@ defmodule Uketsuke.Quota do
         )
 
         case S3.put!(within_deadline!(s3, deadline), key, bytes, condition) do
-          :ok -> receipt
-          :precondition_failed -> reserve!(s3, config, immutable, receipt, deadline)
+          :ok ->
+            Metrics.quota_reserved(used + immutable["file_size"])
+            receipt
+
+          :precondition_failed ->
+            reserve!(s3, config, immutable, receipt, deadline)
         end
     end
   end
@@ -86,14 +87,36 @@ defmodule Uketsuke.Quota do
 
   defp now, do: System.monotonic_time(:millisecond)
 
+  # Startup reading for the reserved-bytes gauge; a missing ledger reserves nothing.
+  def observe!(s3, config) do
+    read!(s3, config.s3_prefix <> "quota.json", config)
+    :ok
+  end
+
   defp read!(s3, key, config) do
     case S3.get!(s3, key) do
-      :missing -> {%{"version" => 1, "reservations" => %{}}, :absent}
-      %{etag: etag, body: body} -> {decode!(body, config), {:match, etag}}
+      :missing ->
+        Metrics.quota_reserved(0)
+        {%{"version" => 1, "reservations" => %{}}, :absent}
+
+      %{etag: etag, body: body} ->
+        {decode!(body, config), {:match, etag}}
     end
   end
 
+  defp reserved_bytes(ledger) do
+    Enum.reduce(ledger["reservations"], 0, fn {_id, entry}, sum ->
+      sum + entry["immutable"]["file_size"]
+    end)
+  end
+
   defp decode!(bytes, config) do
+    ledger = decode_ledger!(bytes, config)
+    Metrics.quota_reserved(reserved_bytes(ledger))
+    ledger
+  end
+
+  defp decode_ledger!(bytes, config) do
     ledger =
       case Jason.decode(bytes, objects: :ordered_objects) do
         {:ok, value} -> unique_objects!(value)

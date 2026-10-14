@@ -113,6 +113,7 @@ pkgs.testers.runNixOSTest {
           s3_region = region;
           s3_endpoint = endpoint;
           s3_prefix = "uketsuke/v1/module/";
+          metrics_port = 4001;
           max_file_bytes = 3000;
           max_total_bytes = 3000;
         };
@@ -120,6 +121,7 @@ pkgs.testers.runNixOSTest {
       systemd.services.uketsuke.wantedBy = pkgs.lib.mkForce [ ];
     };
   testScript = ''
+    import json
     from datetime import timedelta
     start_all()
     inbox.wait_for_unit("floci.service")
@@ -142,8 +144,30 @@ pkgs.testers.runNixOSTest {
         assert inbox.succeed("systemctl show uketsuke -p DynamicUser --value").strip() == "yes"
         assert inbox.succeed("systemctl show uketsuke -p ProtectSystem --value").strip() == "strict"
         print(inbox.succeed("uketsuke-smoke upload"))
+    with subtest("module observability: healthz, loopback metrics and request log"):
+        inbox.wait_for_open_port(4001, addr="127.0.0.1")
+        inbox.succeed("ss -ltn 'sport = :4001' | ${pkgs.gnugrep}/bin/grep 127.0.0.1:4001")
+        inbox.fail("curl --connect-timeout 2 http://$(hostname -I | cut -d' ' -f1):4001/metrics")
+        inbox.fail("curl -sf http://127.0.0.1:4000/metrics")
+        inbox.succeed("curl -sf http://127.0.0.1:4000/healthz | ${pkgs.gnugrep}/bin/grep -F '\"status\":\"ready\"'")
+        metrics = inbox.succeed("curl -sf http://127.0.0.1:4001/metrics")
+        for series in ['uketsuke_requests_total{route="upload",outcome="accepted"} 1',
+                       "uketsuke_roster_ok 1", "uketsuke_inflight 0", "uketsuke_quota_max_bytes 3000"]:
+            assert series in metrics, series
+        reports = [json.loads(l) for l in inbox.succeed("journalctl -u uketsuke -o cat").splitlines() if l.startswith("{")]
+        requests = [r["message"] for r in reports if isinstance(r["message"], dict) and r["message"].get("event") == "request"]
+        accepted = [m for m in requests if m["outcome"] == "accepted"]
+        assert len(accepted) == 1, reports
+        assert {k: v for k, v in accepted[0].items() if k != "duration_ms"} == {
+            "event": "request", "route": "upload", "outcome": "accepted", "status": 201,
+            "pool_id": "ab" * 28, "submission_id": "10" * 16, "file_size": accepted[0]["file_size"],
+        }, accepted[0]
+        assert isinstance(accepted[0]["duration_ms"], int)
+    with subtest("module restart keeps the archive and quota"):
         inbox.succeed("systemctl stop uketsuke; rm -rf /var/lib/uketsuke/staging; systemctl start uketsuke")
         inbox.wait_for_open_port(4000, addr="127.0.0.1")
+        # The startup ledger read fills the gauge before any request touches the ledger.
+        inbox.wait_until_succeeds("curl -sf http://127.0.0.1:4001/metrics | ${pkgs.gnugrep}/bin/grep -E '^uketsuke_quota_reserved_bytes [1-9][0-9]*$'", timeout=30)
         print(inbox.succeed("uketsuke-smoke restart"))
         print(inbox.succeed("uketsuke-smoke quota"))
         inbox.succeed("test -z \"$(ls -A /var/lib/uketsuke/staging)\"")

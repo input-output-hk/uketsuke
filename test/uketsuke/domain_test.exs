@@ -47,6 +47,18 @@ defmodule Uketsuke.DomainTest do
       from_map!(Map.put(config_map(), "max_inflight", 0))
     end
 
+    for port <- [nil, -1, 65_536, "4101", config_map()["port"]] do
+      assert_raise ArgumentError, fn ->
+        from_map!(Map.put(config_map(), "metrics_port", port))
+      end
+    end
+
+    assert from_map!(Map.put(config_map(), "metrics_port", 0)).metrics_port == 0
+
+    for port <- [0, 65_536, "4100"] do
+      assert_raise ArgumentError, fn -> from_map!(Map.put(config_map(), "port", port)) end
+    end
+
     assert_raise ArgumentError, fn ->
       from_map!(Map.put(config_map(), "max_file_bytes", 8_589_934_592))
     end
