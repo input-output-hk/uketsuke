@@ -21,11 +21,11 @@
     {
       packages = forAllSystems (pkgs: rec {
         uketsuke = import ./nix/package.nix { inherit pkgs; };
-        uketsuke-sign = import ./nix/sign.nix {
+        ukc = import ./nix/ukc.nix {
           inherit pkgs;
           arch = pkgs.stdenv.hostPlatform.parsed.cpu.name;
         };
-        uketsuke-sign-release = import ./nix/sign-release.nix { inherit pkgs; };
+        ukc-release = import ./nix/ukc-release.nix { inherit pkgs; };
         floci = import ./nix/floci.nix {
           inherit pkgs;
           image = floci-nix.packages.${pkgs.stdenv.hostPlatform.system}.aws-image;
@@ -37,11 +37,11 @@
       nixosModules.default = self.nixosModules.uketsuke;
       checks = forAllSystems (pkgs: {
         release = self.packages.${pkgs.stdenv.hostPlatform.system}.uketsuke;
-        sign = self.packages.${pkgs.stdenv.hostPlatform.system}.uketsuke-sign;
+        ukc = self.packages.${pkgs.stdenv.hostPlatform.system}.ukc;
         smoke = import ./nix/e2e-test.nix {
           inherit pkgs;
           package = self.packages.${pkgs.stdenv.hostPlatform.system}.uketsuke;
-          signer = self.packages.${pkgs.stdenv.hostPlatform.system}.uketsuke-sign;
+          ukc = self.packages.${pkgs.stdenv.hostPlatform.system}.ukc;
           floci = self.packages.${pkgs.stdenv.hostPlatform.system}.floci;
           module = self.nixosModules.uketsuke;
         };
@@ -54,6 +54,7 @@
             zig
             zip
             curl
+            openssl
             self.packages.${pkgs.stdenv.hostPlatform.system}.floci-dev
             awscli2
             gnutar

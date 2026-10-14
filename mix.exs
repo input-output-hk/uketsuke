@@ -4,7 +4,7 @@ defmodule Uketsuke.MixProject do
   def project do
     [
       app: :uketsuke,
-      version: "1.0.0",
+      version: "1.1.0",
       elixir: "~> 1.18",
       start_permanent: true,
       deps: deps(),

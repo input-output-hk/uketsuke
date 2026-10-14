@@ -9,7 +9,7 @@ let
   deps =
     assert lib.assertMsg (lib.hasPrefix "blst-${pkgs.blst.version}-" blstHash)
       "client/build.zig.zon pins ${blstHash}, nixpkgs has blst ${pkgs.blst.version}";
-    pkgs.linkFarm "uketsuke-sign-zig-deps" [
+    pkgs.linkFarm "ukc-zig-deps" [
       {
         name = blstHash;
         path = pkgs.blst.src;
@@ -29,7 +29,7 @@ let
   ];
 in
 pkgs.stdenvNoCC.mkDerivation {
-  pname = "uketsuke-sign";
+  pname = "ukc";
   version = zonField "version";
   src = lib.fileset.toSource {
     root = ../client;
@@ -53,9 +53,9 @@ pkgs.stdenvNoCC.mkDerivation {
   '';
   passthru.platform = "${arch}-linux";
   meta = {
-    description = "Offline BLS signer producing curl upload requests for Uketsuke";
+    description = "BLS signer and uploader for Uketsuke reports";
     license = lib.licenses.asl20;
     platforms = lib.platforms.linux;
-    mainProgram = "uketsuke-sign";
+    mainProgram = "ukc";
   };
 }

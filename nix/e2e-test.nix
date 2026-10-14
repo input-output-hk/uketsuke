@@ -1,7 +1,7 @@
 {
   pkgs,
   package,
-  signer,
+  ukc,
   floci,
   module,
 }:
@@ -56,7 +56,7 @@ let
     export INBOX_S3_BUCKET=uketsuke
     export INBOX_S3_REGION=${region}
     export INBOX_SERVER_COMMAND="${package}/bin/uketsuke start"
-    export UKETSUKE_SIGN=${pkgs.lib.getExe signer}
+    export UKC=${pkgs.lib.getExe ukc}
     export RELEASE_DISTRIBUTION=none
     export RELEASE_COOKIE=uketsuke-test-nondistributed
     export ERL_FLAGS="+S 2:2"
@@ -79,6 +79,7 @@ pkgs.testers.runNixOSTest {
         pkgs.zip
         pkgs.gnutar
         pkgs.curl
+        pkgs.openssl
         bootstrap
         authCheck
         smoke

@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { watch } from 'node:fs';
 import { mkdtemp, readFile, writeFile, readdir, rm, utimes } from 'node:fs/promises';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 import test from 'node:test';
 import { bls12_381 } from '@noble/curves/bls12-381.js';
 
@@ -37,7 +39,7 @@ requiredEnv('AWS_SECRET_ACCESS_KEY');
 const serverCommand = process.env.INBOX_SERVER_COMMAND
   ? process.env.INBOX_SERVER_COMMAND.trim().split(/\s+/)
   : ['mix', 'run', '--no-halt']; // Developer launcher; packaged smoke selects the release explicitly.
-const signer = requiredEnv('UKETSUKE_SIGN');
+const ukc = requiredEnv('UKC');
 const awsEnv = { ...process.env, AWS_DEFAULT_REGION: region, AWS_EC2_METADATA_DISABLED: 'true' };
 
 function aws(...args) {
@@ -115,7 +117,64 @@ async function faultProxy(fail) {
   };
 }
 
-await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive', { timeout: 240000 }, async t => {
+const literal = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const json = (value, status = 200) => ({ status, headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) });
+
+// A throwaway CA and a localhost certificate it signed, valid for a day.
+async function testCertificates(dir) {
+  const openssl = (...args) => execFileSync('openssl', args, { cwd: dir, stdio: 'pipe' });
+  const ec = ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes'];
+  openssl('req', '-x509', ...ec, '-days', '1', '-subj', '/CN=ukc smoke CA', '-keyout', 'ca.key', '-out', 'ca.pem');
+  openssl('req', ...ec, '-subj', '/CN=localhost', '-keyout', 'tls.key', '-out', 'tls.csr');
+  await writeFile(join(dir, 'tls.ext'), 'subjectAltName=DNS:localhost\n');
+  openssl('x509', '-req', '-in', 'tls.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial',
+    '-days', '1', '-extfile', 'tls.ext', '-out', 'tls.pem');
+  return { ca: join(dir, 'ca.pem'), key: await readFile(join(dir, 'tls.key')), cert: await readFile(join(dir, 'tls.pem')) };
+}
+
+// Answers at its own loopback origin with `answerFor(origin, path)`: an
+// { status, headers, body } record, or a function of (request, body) giving
+// one. Unanswered /v1/ paths go to `service`. With `tls` ({ key, cert }) the
+// origin is https://localhost.
+async function campaignHost(service, answerFor, tls) {
+  const upstream = new URL(service);
+  const handler = (req, res) => {
+    const answer = answerFor(origin, req.url.replace(/^\/v1\/uploads\/[0-9a-f]+$/, '/v1/uploads/ID'));
+    if (answer || !req.url.startsWith('/v1/')) {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const record = typeof answer === 'function' ? answer(req, Buffer.concat(chunks)) : answer;
+        const { status, headers, body } = record ?? { status: 404, headers: {}, body: '' };
+        res.writeHead(status, headers);
+        res.end(body);
+      });
+      return;
+    }
+    const forward = httpRequest({
+      host: upstream.hostname, port: upstream.port, method: req.method, path: req.url, headers: req.headers,
+    }, answer => {
+      res.writeHead(answer.statusCode, answer.headers);
+      answer.pipe(res);
+    });
+    forward.on('error', error => res.destroy(error));
+    req.pipe(forward);
+  };
+  const host = tls ? createHttpsServer(tls, handler) : createHttpServer(handler);
+  // Dual-stack, since localhost may resolve to ::1 or 127.0.0.1.
+  host.listen(0, tls ? '::' : '127.0.0.1');
+  await once(host, 'listening');
+  const origin = tls ? `https://localhost:${host.address().port}` : `http://127.0.0.1:${host.address().port}`;
+  return {
+    origin,
+    close: () => new Promise((resolve, reject) => {
+      host.closeAllConnections();
+      host.close(error => error ? reject(error) : resolve());
+    }),
+  };
+}
+
+await test('real signed uploads: ukc, curl, Elixir/blst, and S3 Archive', { timeout: 240000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'uketsuke-smoke-'));
   let server;
   let output = '';
@@ -146,7 +205,7 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
   const config = {
     port, metrics_port: 0, service, network: campaign.network, campaign: campaign.campaign,
     staging_dir: staging, roster_path: rosterPath,
-    max_file_bytes: report.length * 2, max_total_bytes: report.length * 4,
+    max_file_bytes: report.length * 2, max_total_bytes: report.length * 5,
     max_inflight: 2, max_manifest_bytes: 4096, max_lifetime_secs: 3600,
     upload_timeout_ms: 2000, roster_max_age_secs: 3600,
     s3_bucket: bucket, s3_region: region, s3_endpoint: endpoint,
@@ -243,8 +302,13 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
     return socket;
   }
   await start();
-  const sign = out => JSON.parse(execFileSync(signer, ['--key', join(dir, 'bls.skey'),
+  const sign = out => JSON.parse(execFileSync(ukc, ['sign', '--key', join(dir, 'bls.skey'),
     '--file', reportPath, '--pool', pool, '--campaign', join(dir, 'campaign.json'), '--out', join(dir, out)], { encoding: 'utf8' }));
+  // Asynchronous, so campaignHost in this process can answer ukc.
+  const sendWith = (env, ...args) => new Promise(resolve => execFile(ukc,
+    ['send', '--key', join(dir, 'bls.skey'), '--file', reportPath, ...args], { encoding: 'utf8', timeout: 30000, env },
+    (error, stdout, stderr) => resolve({ status: error ? error.code ?? error.signal : 0, stdout, stderr })));
+  const send = (...args) => sendWith(process.env, ...args);
   const curl = (out, config) => spawnSync('curl', ['-q', '-K', join(dir, out, config)], { encoding: 'utf8' });
   const receiptOf = (out, config) => {
     const result = curl(out, config);
@@ -252,7 +316,7 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
     return JSON.parse(result.stdout);
   };
 
-  await t.test('signer and curl publish one self-verifiable Bundle in S3', async () => {
+  await t.test('ukc sign and curl publish one self-verifiable Bundle in S3', async () => {
     const signed = sign('request');
     assert.equal(signed.public_key, key);
     assert.equal(signed.file_hash, digest);
@@ -280,6 +344,98 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
     const refreshed = { ...original, expires_at: original.expires_at + 1 };
     const response = await fetch(`${service}/v1/receipts/${original.submission_id}`, { headers: authentication(refreshed) });
     assert.equal(response.status, 200, await response.text());
+  });
+  let sent;
+  await t.test('ukc send uploads, prints the Receipt, and recovers it with --id', async () => {
+    const result = await send('--pool', pool, '--campaign', join(dir, 'campaign.json'));
+    assert.equal(result.status, 0, result.stderr);
+    sent = JSON.parse(result.stdout);
+    assert.equal(sent.durability, 's3');
+    assert.equal(sent.file_hash, digest);
+    assert.match(result.stderr, new RegExp(`^submission ${sent.submission_id}: uploading ${report.length} bytes to ${literal(service)}\n$`));
+    assert.deepEqual(archiveEntry(sent.submission_id).receipt, sent);
+    const retry = await send('--pool', pool, '--campaign', join(dir, 'campaign.json'), '--id', sent.submission_id);
+    assert.equal(retry.status, 0, retry.stderr);
+    assert.deepEqual(JSON.parse(retry.stdout), sent);
+  });
+  await t.test('ukc send fetches campaign URLs only from the service they name, without redirects', async () => {
+    const host = await campaignHost(service, (origin, path) => ({
+      '/own.json': json({ ...campaign, service: origin }),
+      '/foreign.json': json(campaign),
+      '/moved.json': { status: 302, headers: { location: '/own.json' }, body: '' },
+    })[path]);
+    try {
+      const own = await send('--pool', pool, '--campaign', `${host.origin}/own.json`);
+      assert.equal(own.status, 1);
+      assert.match(own.stderr, /upload rejected with HTTP 403: .*"wrong_service"/);
+      const foreign = await send('--pool', pool, '--campaign', `${host.origin}/foreign.json`);
+      assert.equal(foreign.status, 1);
+      assert.match(foreign.stderr, /names service http:\/\/127\.0\.0\.1:\d+; a fetched campaign must name its own origin/);
+      const moved = await send('--pool', pool, '--campaign', `${host.origin}/moved.json`);
+      assert.equal(moved.status, 1);
+      assert.match(moved.stderr, /moved\.json answered HTTP 302/);
+    } finally { await host.close(); }
+  });
+  await t.test('ukc send fetches and uploads over HTTPS, trusting SSL_CERT_FILE in place of the system CAs', async () => {
+    const certs = await testCertificates(dir);
+    let uploaded;
+    const host = await campaignHost(service, (origin, path) => ({
+      '/tls.json': json({ ...campaign, service: origin }),
+      '/v1/uploads/ID': (req, body) => {
+        const signed = JSON.parse(Buffer.from(req.headers['x-upload-manifest'], 'base64'));
+        uploaded = { service: signed.service, hash: createHash('sha256').update(body).digest('hex'), size: body.length };
+        return json({ submission_id: signed.submission_id, file_hash: uploaded.hash, file_size: body.length }, 201);
+      },
+    })[path], { key: certs.key, cert: certs.cert });
+    try {
+      const { SSL_CERT_FILE, ...systemCas } = process.env;
+      const untrusted = await sendWith(systemCas, '--pool', pool, '--campaign', `${host.origin}/tls.json`);
+      assert.equal(untrusted.status, 1);
+      assert.match(untrusted.stderr, new RegExp(`cannot connect to ${literal(host.origin)}/tls\\.json: `));
+      assert.equal(uploaded, undefined);
+      const trusted = await sendWith({ ...systemCas, SSL_CERT_FILE: certs.ca }, '--pool', pool, '--campaign', `${host.origin}/tls.json`);
+      assert.equal(trusted.status, 0, trusted.stderr);
+      assert.equal(JSON.parse(trusted.stdout).file_hash, digest);
+      assert.deepEqual(uploaded, { service: host.origin, hash: digest, size: report.length });
+    } finally { await host.close(); }
+  });
+  await t.test('ukc send accepts only a receipt for its submission, and classifies rejections', async () => {
+    const host = await campaignHost(service, (origin, path) => ({
+      '/portal.json': json({ ...campaign, service: origin }),
+      '/v1/uploads/ID': { status: 200, headers: { 'content-type': 'text/html' }, body: '<html>Sign in to Wi-Fi</html>' },
+    })[path]);
+    try {
+      const portal = await send('--pool', pool, '--campaign', `${host.origin}/portal.json`);
+      assert.equal(portal.status, 1);
+      assert.equal(portal.stdout, '');
+      assert.match(portal.stderr, /HTTP 200 answer is not a receipt for this submission: <html>Sign in to Wi-Fi<\/html>; retry with --id [0-9a-f]{32}/);
+    } finally { await host.close(); }
+    const unavailable = JSON.stringify({ error: { code: 'storage_failed' } });
+    const busy = await campaignHost(service, (origin, path) => ({
+      '/busy.json': json({ ...campaign, service: origin }),
+      '/v1/uploads/ID': { status: 503, headers: {}, body: unavailable },
+    })[path]);
+    try {
+      const failed = await send('--pool', pool, '--campaign', `${busy.origin}/busy.json`);
+      assert.equal(failed.status, 1);
+      assert.match(failed.stderr, new RegExp(`upload failed with HTTP 503: ${literal(unavailable)}; retry with --id [0-9a-f]{32}\n$`));
+    } finally { await busy.close(); }
+    const error = JSON.stringify({ error: { code: 'key_not_registered' } });
+    const gzipped = await campaignHost(service, (origin, path) => ({
+      '/gzip.json': json({ ...campaign, service: origin }),
+      '/v1/uploads/ID': { status: 403, headers: { 'content-encoding': 'gzip' }, body: gzipSync(error) },
+    })[path]);
+    try {
+      const rejected = await send('--pool', pool, '--campaign', `${gzipped.origin}/gzip.json`);
+      assert.equal(rejected.status, 1);
+      assert.match(rejected.stderr, new RegExp(`upload rejected with HTTP 403: ${literal(error)}\n$`));
+    } finally { await gzipped.close(); }
+  });
+  await t.test('ukc send reports a rejected upload with the server error and a failing exit', async () => {
+    const result = await send('--pool', 'cd'.repeat(28), '--campaign', join(dir, 'campaign.json'));
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /upload rejected with HTTP 403: .*"key_not_registered"/);
   });
   await t.test('same Submission ID cannot replace different content', async () => {
     const response = await put({ ...original, file_hash: '00'.repeat(32) });
@@ -412,7 +568,8 @@ await test('real signed uploads: Zig signer, curl, Elixir/blst, and S3 Archive',
     assert.equal(lost.status, 200);
     assert.deepEqual(await lost.json(), archiveEntry(third.submission_id).receipt);
     assert.deepEqual(archiveEntry(second.submission_id).report, report);
-    assert.deepEqual(keys(), [original, retried, second, third].map(m => objectKey(m.submission_id)).sort());
+    assert.ok(sent, 'the ukc send upload subtest failed earlier');
+    assert.deepEqual(keys(), [original, sent, retried, second, third].map(m => objectKey(m.submission_id)).sort());
   });
   await t.test('healthz, loopback metrics and request log lines observe the restarted server', async () => {
     const health = await fetch(`${service}/healthz`);

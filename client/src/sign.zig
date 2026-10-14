@@ -1,5 +1,6 @@
-//! Input validation, Manifest encoding, BLS signing and curl request files.
-//! Nothing here performs I/O; `main.zig` owns files, clock and entropy.
+//! Input validation, Manifest encoding, BLS signing and request rendering.
+//! Nothing here performs I/O; `main.zig` owns files, clock and entropy, and
+//! `send.zig` owns the network.
 
 const std = @import("std");
 const blst = @import("blst");
@@ -60,6 +61,8 @@ pub fn parseKey(gpa: std.mem.Allocator, text: []const u8, d: *Diagnostic) error{
         return d.fail("--key is not a TextEnvelope JSON object", .{});
     defer parsed.deinit();
     const envelope = .{ .type = parsed.value.type.slice, .cborHex = parsed.value.cborHex.slice };
+    // An escaped string is copied out of `text`, which the caller zeroes itself.
+    defer if (!within(envelope.cborHex, text)) std.crypto.secureZero(u8, @constCast(envelope.cborHex));
 
     const known_type = for (key_types) |name| {
         if (std.mem.eql(u8, envelope.type, name)) break true;
@@ -81,6 +84,11 @@ pub fn parseKey(gpa: std.mem.Allocator, text: []const u8, d: *Diagnostic) error{
         return d.fail("invalid BLS secret scalar", .{});
     }
     return key;
+}
+
+fn within(part: []const u8, whole: []const u8) bool {
+    const start = @intFromPtr(whole.ptr);
+    return @intFromPtr(part.ptr) >= start and @intFromPtr(part.ptr) + part.len <= start + whole.len;
 }
 
 /// A JSON string token. std.json alone also turns an array of numbers into bytes.
@@ -211,31 +219,59 @@ pub fn isDisplayName(name: []const u8) bool {
     return std.unicode.utf8ValidateSlice(name) and std.mem.trim(u8, name, " \t\r\n").len != 0;
 }
 
-pub const Route = enum { uploads, receipts };
+/// Returns the origin of an `origin/path` campaign URL that `isAllowedOrigin`
+/// accepts. A fetched campaign must name this origin as its service, so the
+/// host authenticated by TLS is the one the Manifest is signed for.
+pub fn campaignUrlOrigin(url: []const u8) ?[]const u8 {
+    const scheme_end = (std.mem.indexOf(u8, url, "://") orelse return null) + "://".len;
+    const path = std.mem.indexOfScalarPos(u8, url, scheme_end, '/') orelse return null;
+    const origin = url[0..path];
+    return if (isAllowedOrigin(origin)) origin else null;
+}
+
+pub const Route = union(enum) {
+    /// Absolute path of the signed report.
+    uploads: []const u8,
+    receipts,
+};
 
 pub const Request = struct {
     service: []const u8,
     submission_id: []const u8,
-    /// Absolute path of the signed report.
-    report: []const u8,
     manifest: []const u8,
     public_key: [blst.P2_COMPRESS_BYTES]u8,
     signature: [blst.P1_COMPRESS_BYTES]u8,
+
+    pub fn url(request: Request, arena: std.mem.Allocator, route: std.meta.Tag(Route)) error{OutOfMemory}![]u8 {
+        return std.fmt.allocPrint(arena, "{s}/v1/{t}/{s}", .{ request.service, route, request.submission_id });
+    }
+
+    /// The authentication headers of both routes; values live in `arena`,
+    /// which owns them since the headers do not carry their allocation.
+    pub fn headers(request: Request, arena: std.mem.Allocator) error{OutOfMemory}![3]std.http.Header {
+        const encoder = std.base64.standard.Encoder;
+        const manifest = try arena.alloc(u8, encoder.calcSize(request.manifest.len));
+        return .{
+            .{ .name = "x-upload-manifest", .value = encoder.encode(manifest, request.manifest) },
+            .{ .name = "x-upload-key", .value = try arena.dupe(u8, &std.fmt.bytesToHex(request.public_key, .lower)) },
+            .{ .name = "x-upload-signature", .value = try arena.dupe(u8, &std.fmt.bytesToHex(request.signature, .lower)) },
+        };
+    }
 };
 
 /// Writes a `curl --config` file sending `request` to `route`.
-pub fn writeCurlConfig(w: *Writer, route: Route, request: Request) Writer.Error!void {
+pub fn writeCurlConfig(w: *Writer, arena: std.mem.Allocator, route: Route, request: Request) (Writer.Error || error{OutOfMemory})!void {
     try w.print("# Submission {s}; holds no private key.\n", .{request.submission_id});
-    try w.print("url = \"{s}/v1/{t}/{s}\"\n", .{ request.service, route, request.submission_id });
-    if (route == .uploads) {
-        try w.writeAll("upload-file = \"");
-        try writeCurlString(w, request.report);
-        try w.writeAll("\"\nheader = \"content-type: application/zip\"\n");
+    try w.print("url = \"{s}\"\n", .{try request.url(arena, route)});
+    switch (route) {
+        .uploads => |report| {
+            try w.writeAll("upload-file = \"");
+            try writeCurlString(w, report);
+            try w.writeAll("\"\nheader = \"content-type: application/zip\"\n");
+        },
+        .receipts => {},
     }
-    try w.writeAll("header = \"x-upload-manifest: ");
-    try std.base64.standard.Encoder.encodeWriter(w, request.manifest);
-    try w.print("\"\nheader = \"x-upload-key: {s}\"\n", .{std.fmt.bytesToHex(request.public_key, .lower)});
-    try w.print("header = \"x-upload-signature: {s}\"\n", .{std.fmt.bytesToHex(request.signature, .lower)});
+    for (try request.headers(arena)) |header| try w.print("header = \"{s}: {s}\"\n", .{ header.name, header.value });
     // Report names and IPv6 hosts contain [] and {}, which curl otherwise expands.
     try w.writeAll("globoff\nfail-with-body\nsilent\nshow-error\n");
 }
@@ -299,6 +335,8 @@ test "cold keys, out-of-range scalars and malformed envelopes are rejected" {
         .{ .text = textEnvelope(bls, fixture_scalar[2..]), .message = "TextEnvelope containing a 32-byte scalar" },
         .{ .text = textEnvelope(bls, "zz" ++ fixture_scalar[2..]), .message = "TextEnvelope containing a 32-byte scalar" },
         .{ .text = "{\"type\":\"" ++ bls ++ "\",\"cborHex\":x5820" ++ fixture_scalar ++ "}", .message = "not a TextEnvelope JSON object" },
+        // Escaped, so the parser copies it out of the text; the copy is zeroed.
+        .{ .text = "{\"type\":\"" ++ bls ++ "\",\"cborHex\":\"\\u0035820" ++ fixture_scalar[2..] ++ "\"}", .message = "TextEnvelope containing a 32-byte scalar" },
     };
     for (cases) |case| {
         try testing.expectError(error.Failed, parseKey(testing.allocator, case.text, &d));
@@ -365,18 +403,40 @@ test "only serialized origins are signed, and plain HTTP only on loopback" {
     }) |origin| try testing.expect(!isAllowedOrigin(origin));
 }
 
+test "campaign URLs yield their origin only under an allowed origin with a path" {
+    const cases = [_]struct { url: []const u8, origin: ?[]const u8 }{
+        .{ .url = "https://uketsuke.example.org/campaigns/glue.json", .origin = "https://uketsuke.example.org" },
+        .{ .url = "https://uketsuke.example.org:8443/c.json", .origin = "https://uketsuke.example.org:8443" },
+        .{ .url = "http://127.0.0.1:4100/campaign.json", .origin = "http://127.0.0.1:4100" },
+        .{ .url = "http://[::1]:4100/", .origin = "http://[::1]:4100" },
+        .{ .url = "http://uketsuke.example.org/campaigns/glue.json", .origin = null },
+        .{ .url = "https://uketsuke.example.org", .origin = null },
+        .{ .url = "https://Uketsuke.example.org/c.json", .origin = null },
+        .{ .url = "https://uketsuke.example.org:443/c.json", .origin = null },
+        .{ .url = "https://user@uketsuke.example.org/c.json", .origin = null },
+        .{ .url = "campaigns/glue.json", .origin = null },
+    };
+    for (cases) |case| {
+        const origin = campaignUrlOrigin(case.url);
+        if (case.origin) |expected| try testing.expectEqualStrings(expected, origin.?) else try testing.expectEqual(null, origin);
+    }
+}
+
 test "upload config escapes the report path and disables globbing" {
-    var out: Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-    try writeCurlConfig(&out.writer, .uploads, .{
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var out: Writer.Allocating = .init(arena.allocator());
+    try writeCurlConfig(&out.writer, arena.allocator(), .{ .uploads = "/tmp/a \"b\"\\c\nd[1]{x}.zip" }, .{
         .service = "http://[::1]:4100",
         .submission_id = "10" ** 16,
-        .report = "/tmp/a \"b\"\\c\nd[1]{x}.zip",
         .manifest = "{}",
         .public_key = @splat(0xaa),
         .signature = @splat(0xbb),
     });
     const config = out.written();
+    try testing.expect(std.mem.indexOf(u8, config, "\nurl = \"http://[::1]:4100/v1/uploads/" ++ "10" ** 16 ++ "\"\n") != null);
     try testing.expect(std.mem.indexOf(u8, config, "\nupload-file = \"/tmp/a \\\"b\\\"\\\\c\\nd[1]{x}.zip\"\n") != null);
+    try testing.expect(std.mem.indexOf(u8, config, "\nheader = \"x-upload-manifest: e30=\"\n") != null);
+    try testing.expect(std.mem.indexOf(u8, config, "\nheader = \"x-upload-key: " ++ "aa" ** 96 ++ "\"\n") != null);
     try testing.expect(std.mem.indexOf(u8, config, "\ngloboff\n") != null);
 }

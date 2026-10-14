@@ -8,43 +8,91 @@
 
 Campaign service, network, and campaign must match server configuration; the
 lifetime must fit `max_lifetime_secs`. For a real network, use an identifier
-tied unambiguously to its genesis. Only loopback HTTP is permitted by the
-signer; remote origins must use HTTPS.
+tied unambiguously to its genesis. Only loopback HTTP is permitted by `ukc`;
+remote origins must use HTTPS.
 
 Signing reads the local report incrementally, hashes it with SHA-256 and signs
 a manifest. It accepts both current and historical `Mininimal` BLS
-TextEnvelope spellings, rejects cold keys and invalid scalars, and writes a new
-private request directory without overwriting one: `manifest.json` holds the
-exact signed bytes; `upload.curl` and `receipt.curl` are curl config files with
-the destination URL, the report's absolute path, the base64 manifest, public
-key and signature, never the signing key.
+TextEnvelope spellings and rejects cold keys and invalid scalars. The signing
+key never leaves `ukc`.
+
+### `ukc send`
+
+`--campaign` takes a local file or an `https://host/path` URL (`http://` only
+on loopback). A fetched campaign must name the URL's origin as its `service`,
+so the host authenticated by TLS is the one the Manifest is signed for and the
+upload goes to. TLS trusts the system CA bundle (`/etc/ssl/certs/` and the
+usual distribution paths), or only the PEM bundle named by `SSL_CERT_FILE`
+when that is set. Proxy variables are ignored: Zig's HTTP client would tunnel
+HTTPS through a proxy without a TLS handshake with the service. Behind a
+proxy, use `ukc sign` and curl. Redirects are never followed, for the
+campaign or the upload. Each request must connect (DNS, TCP and TLS) within
+30 s, and is then canceled after 60 s without bytes sent or received. The wait
+for the server's answer counts as such silence, so a server that takes longer
+than 60 s to publish fails the upload; retry with `--id`.
+
+Before uploading, `ukc send` checks that the report's size and mtime are
+unchanged since hashing, then prints `submission <id>: uploading <n> bytes to
+<service>` to stderr. It streams exactly the signed size from the same open
+file, with that `Content-Length`. Changes during the upload are caught by the
+server: a modified signed range is rejected (422) and never published, while
+bytes appended past the signed size are not sent, so the signed report is
+archived. A report that shrinks is refused locally.
+
+`ukc send` exits 0 and prints the receipt JSON on stdout only for a 2xx answer
+whose body is a receipt for this submission. Everything else exits 1 with the
+reason on stderr: a 4xx rejection with the server's JSON error; a 5xx, 408 or
+429 answer, a 2xx that is not this submission's receipt (a captive portal, for
+example), or a timeout or connection failure during the upload, each with
+`retry with --id <id>`.
+
+### `ukc sign` and curl
+
+`ukc sign` never touches the network and takes only a local `--campaign` file.
+It writes a new private request directory without overwriting one:
+`manifest.json` holds the exact signed bytes; `upload.curl` and `receipt.curl`
+are curl config files with the destination URL, the report's absolute path,
+the base64 manifest, public key and signature, never the signing key.
 
 `curl -q -K request/upload.curl` sends the report with an exact `Content-Length`
-and prints the receipt; save it. `receipt.curl` fetches the receipt without
-sending the report. The configs need curl 7.76.0 or newer: older curl ignores
-`fail-with-body` with a warning and exits 0 on a rejection. A 4xx/5xx answer
-makes curl exit 22 with the status on stderr and the server's JSON error on
-stdout. Redirects are not followed, so a 3xx from a proxy in front of the
-service exits 0 without printing a receipt. Both configs disable curl's URL
-globbing, so `[]` and `{}` in report paths and IPv6 hosts stay literal. curl
-does not re-hash the report; a report changed after signing is rejected (422)
-and never published. Keep the report and request directory until the receipt
-is saved.
+and prints the receipt; save it. Keep `-q` first: it prevents local curl
+configuration from overriding transport settings. `receipt.curl` fetches the
+receipt without sending the report. The configs need curl 7.76.0 or newer:
+older curl ignores `fail-with-body` with a warning and exits 0 on a rejection.
+A 4xx/5xx answer makes curl exit 22 with the status on stderr and the server's
+JSON error on stdout. Redirects are not followed, so a 3xx from a proxy in
+front of the service exits 0 without printing a receipt. Both configs disable
+curl's URL globbing, so `[]` and `{}` in report paths and IPv6 hosts stay
+literal. curl does not re-hash the report; a report changed after signing is
+rejected (422) and never published. Keep the report and request directory
+until the receipt is saved.
+
+### Retries and recovery
 
 Retries with the same ID and immutable metadata return the original receipt;
-conflicting content gets 409. After expiry, rerun the signing command with
-`--id PREVIOUS_SUBMISSION_ID --out fresh-request` and unchanged file/metadata,
-then run `curl -q -K fresh-request/receipt.curl`. Receipt lookup
+conflicting content gets 409. Rerun `ukc send` with
+`--id PREVIOUS_SUBMISSION_ID` and the unchanged report; it signs a fresh expiry
+and returns the original receipt. To recover the receipt without resending the
+report, sign again with the same report, key, pool and campaign, which rebuilds
+the Manifest from the report's hash:
+
+```console
+ukc sign --key bls.skey --file report.zip --pool POOL_HEX --campaign campaign.json \
+  --id PREVIOUS_SUBMISSION_ID --out fresh-request
+curl -q -K fresh-request/receipt.curl
+```
+
+Receipt lookup
 requires a currently accepted roster key, so an outage or key rotation can
 prevent recovery with an old key.
 
 ## Release builds
 
-The signer is a static Linux binary without runtime dependencies.
-`nix build .#uketsuke-sign-release` cross-builds
-`uketsuke-sign-<version>-x86_64-linux` and
-`uketsuke-sign-<version>-aarch64-linux` (musl, no dynamic loader) plus
-`SHA256SUMS`. This builds artifacts; it does not publish them.
+`ukc` is a static Linux binary without a dynamic loader or shared libraries;
+`ukc send` over HTTPS needs a CA bundle on the host (see `ukc send` above).
+Release assets named `ukc-*` start at 1.1.0. `nix build .#ukc-release` cross-builds `ukc-<version>-x86_64-linux` and
+`ukc-<version>-aarch64-linux` (musl, no dynamic loader) plus `SHA256SUMS`.
+This builds artifacts; it does not publish them.
 
 Verify downloaded assets on the signing host:
 
@@ -53,7 +101,7 @@ sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 An operator can independently rebuild at the release commit with
-`nix build .#uketsuke-sign-release --rebuild` and compare the resulting binary
+`nix build .#ukc-release --rebuild` and compare the resulting binary
 checksums. The x86-64 smoke does not execute the aarch64 binary.
 
 ## Operate the service
@@ -70,14 +118,19 @@ $env.INBOX_CONFIG = (pwd | path join config.local.json)
 mix run --no-halt
 ```
 
+Uketsuke does not serve campaign JSON. For `ukc send --campaign URL`, publish
+`{"service", "network", "campaign", "lifetime_secs"}` at a path on the service's
+own origin (for example a static file at `/campaigns/<campaign>.json` in the
+reverse proxy), with `service` equal to that origin, and announce the URL.
+
 The Key Roster format is
 `{"epoch": N, "slot": N, "pools": {"POOL_HEX": ["BLS_PUBLIC_KEY_HEX"]}}`.
 It must come from a trusted chain query, not from the person uploading data.
 Uketsuke does not generate the roster.
 
-The flake exports `packages.<system>.uketsuke`, `packages.<system>.uketsuke-sign`,
-`packages.<system>.uketsuke-sign-release`,
-`nixosModules.uketsuke`, and `checks.<system>.release` / `checks.<system>.sign`
+The flake exports `packages.<system>.uketsuke`, `packages.<system>.ukc`,
+`packages.<system>.ukc-release`,
+`nixosModules.uketsuke`, and `checks.<system>.release` / `checks.<system>.ukc`
 / `checks.<system>.smoke`. Example module configuration; replace the destination,
 network, campaign, bucket, region, and file paths for your service:
 
@@ -173,8 +226,8 @@ other messages are a JSON string in `message`.
 
 ## Develop and test
 
-The Nix development shell supplies Elixir/OTP, Zig, blst, Node, curl, zip,
-tar, AWS CLI and the `floci-dev` launcher. Zigler uses `ZIG_EXECUTABLE_PATH`
+The Nix development shell supplies Elixir/OTP, Zig, blst, Node, curl, OpenSSL,
+zip, tar, AWS CLI and the `floci-dev` launcher. Zigler uses `ZIG_EXECUTABLE_PATH`
 and links `$BLST_DIR/lib/libblst.a`; both are set by the shell. Node and
 `@noble/curves` serve only the smoke harness, which forges malformed and
 foreign-domain requests; operators never need them.
@@ -187,15 +240,17 @@ mix compile --warnings-as-errors
 npm ci --prefix client --ignore-scripts --no-audit --no-fund
 mix test
 zig build --build-file client/build.zig test
-nix build .#uketsuke .#uketsuke-sign
+nix build .#uketsuke .#ukc
 ```
 
 `mix test` covers Manifest validation, real BLS authorization, Bundle round
 trips and malformed archives. S3 integration tests are
 tagged `s3` and excluded unless explicitly included. `zig build test` covers
-the signer: the cardano-cli golden key in both spellings, rejected cold keys and
-out-of-range scalars, signature verification and domain separation, campaign
-and origin validation, and curl config escaping.
+`ukc`: the cardano-cli golden key in both spellings, rejected cold keys and
+out-of-range scalars, signature verification and domain separation, campaign,
+origin and campaign URL validation, curl config escaping, and the `ukc send`
+watchdog: connect versus stall phases, and cancelation of a fetch from a
+server that never answers and of an upload to a peer that stops reading.
 
 **Backend prerequisite:** the Archive needs atomic `If-None-Match: *` and
 `If-Match` PUT semantics. Production uses AWS S3. Development and the NixOS
@@ -219,16 +274,21 @@ contacts AWS and stops the emulator on exit.
 ```nu
 open /tmp/uketsuke-floci/env.json | load-env
 zig build --build-file client/build.zig
-$env.UKETSUKE_SIGN = (pwd | path join client/zig-out/bin/uketsuke-sign)
+$env.UKC = (pwd | path join client/zig-out/bin/ukc)
 mix test --include s3
 node --test client/smoke.test.mjs
 nix build .#checks.x86_64-linux.smoke
 ```
 
-The smoke signs a real ZIP with `uketsuke-sign`, sends it with curl through the
-server and checks S3 Bundle bytes, rejection paths, interrupted/stalled
-transfers, Receipt replay, and quota after restart with empty staging. The NixOS
-smoke runs the packaged release and signer without runtime compilation, plus a
+The smoke signs a real ZIP with `ukc sign` and sends it with curl, and uploads
+it with `ukc send` against the real server (local campaign, `--id` recovery,
+4xx rejections). Against stand-in hosts it checks fetched campaigns: refused
+foreign origins and redirects, an HTTPS fetch and upload trusted only through
+`SSL_CERT_FILE` (openssl makes a throwaway CA), and 5xx, captive-portal and
+gzipped answers. It checks S3 Bundle bytes, rejection paths,
+interrupted/stalled transfers, Receipt replay, and quota after restart with
+empty staging. The NixOS smoke runs the packaged release and `ukc` without
+runtime compilation, plus a
 separate `services.uketsuke` instance for loopback confinement and restart
 checks. It also restarts Floci itself and checks that the Bundle ETag, quota
 ledger and registered key survive while a wrong secret is still rejected.
