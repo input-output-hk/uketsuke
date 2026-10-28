@@ -7,7 +7,8 @@
 ## Upload details
 
 Campaign service, network, and campaign must match server configuration; the
-lifetime must fit `max_lifetime_secs`. For a real network, use an identifier
+expiry may be at most `campaign_lifetime` + `clock_skew` past the server's
+clock. For a real network, use an identifier
 tied unambiguously to its genesis. Only loopback HTTP is permitted by `ukc`;
 remote origins must use HTTPS.
 
@@ -27,9 +28,12 @@ when that is set. Proxy variables are ignored: Zig's HTTP client would tunnel
 HTTPS through a proxy without a TLS handshake with the service. Behind a
 proxy, use `ukc sign` and curl. Redirects are never followed, for the
 campaign or the upload. Each request must connect (DNS, TCP and TLS) within
-30 s, and is then canceled after 60 s without bytes sent or received. The wait
-for the server's answer counts as such silence, so a server that takes longer
-than 60 s to publish fails the upload; retry with `--id`.
+30 s, and is then canceled after 60 s without bytes sent or received. While
+it writes the Bundle and publishes it, the server sends `103 Early Hints` every
+`progress_interval` (under 60 s); `ukc` counts each as progress and waits for
+the final answer. Through a proxy that drops 1xx responses, a publish slower
+than 60 s fails the upload; retry with `--id`. `curl` prints the 103s with
+`-v` and ignores them otherwise.
 
 Before uploading, `ukc send` checks that the report's size and mtime are
 unchanged since hashing, then prints `submission <id>: uploading <n> bytes to
@@ -94,6 +98,12 @@ Release assets named `ukc-*` start at 1.1.0. `nix build .#ukc-release` cross-bui
 `ukc-<version>-aarch64-linux` (musl, no dynamic loader) plus `SHA256SUMS`.
 This builds artifacts; it does not publish them.
 
+The server and `ukc` are versioned apart: the server version is in `mix.exs`,
+the client version in `client/build.zig.zon`, and only the client's own code
+bumps the latter. A release is a repo state and carries the client build from
+its commit, so a server-only release republishes the same `ukc-<version>-*`
+bytes under the asset names they already had; the checksums make that visible.
+
 Verify downloaded assets on the signing host:
 
 ```console
@@ -102,9 +112,36 @@ sha256sum -c --ignore-missing SHA256SUMS
 
 An operator can independently rebuild at the release commit with
 `nix build .#ukc-release --rebuild` and compare the resulting binary
-checksums. The x86-64 smoke does not execute the aarch64 binary.
+checksums. The NixOS VM smoke uses the x86-64 client. The aarch64 release
+binary also passes the upload smoke suite under QEMU user emulation on an
+x86-64 host with aarch64 binfmt support; native ARM hardware is not tested.
 
 ## Operate the service
+
+### Upgrade from 1.1.x
+
+Version 1.2.0 changes the JSON configuration keys and the corresponding
+`services.uketsuke.settings` options. Migrate them before restarting:
+
+| Previous setting | Replacement example |
+| --- | --- |
+| `upload_timeout_ms: 120000` | `upload_timeout: "2m"` |
+| `roster_max_age_secs: 3600` | `roster_max_age: "1h"` |
+| `s3_timeout_ms: 30000` | `s3_timeout: "30s"` |
+| `max_lifetime_secs: 900` | `campaign_lifetime: "10m"` and `clock_skew: "5m"` |
+
+Choose `campaign_lifetime` and `clock_skew` explicitly: their sum replaces
+the previous maximum lifetime, and `campaign_lifetime` must be at least
+twice `clock_skew`. Add `progress_interval: "15s"`, which must be under 60 s.
+The NixOS module supplies defaults for these duration settings; direct JSON
+configuration requires every key. Preserve deployment-specific timeout and
+roster-age values when converting units.
+
+Replace separately hosted campaign JSON and landing pages with proxy routes
+to the application. When using the optional nginx integration, retain the
+deployment's TLS, firewall and rate-limit configuration. Other proxies must
+forward HTTP/1.1 informational responses so upload progress reaches `ukc`.
+Upgrade the client to 1.2.0 to handle those progress responses.
 
 Copy `config.example.json` to `config.local.json`, provide a trusted refreshed
 Key Roster and set runtime AWS credentials before starting. All JSON fields are
@@ -118,10 +155,24 @@ $env.INBOX_CONFIG = (pwd | path join config.local.json)
 mix run --no-halt
 ```
 
-Uketsuke does not serve campaign JSON. For `ukc send --campaign URL`, publish
-`{"service", "network", "campaign", "lifetime_secs"}` at a path on the service's
-own origin (for example a static file at `/campaigns/<campaign>.json` in the
-reverse proxy), with `service` equal to that origin, and announce the URL.
+Every key is required. Durations (`campaign_lifetime`, `clock_skew`,
+`upload_timeout`, `roster_max_age`, `s3_timeout`, `progress_interval`) are
+strings of a positive
+integer and a unit, `ms`, `s`, `m` or `h`: `"30s"`, `"15m"`. Anything else,
+a bare number included, is refused at startup.
+
+The server publishes its Campaign from config. `GET /campaigns/<campaign>.json`
+answers `{"service", "network", "campaign", "lifetime_secs"}`, the URL to
+announce for `ukc send --campaign`. `lifetime_secs` is `campaign_lifetime`.
+The server accepts expiries up to `campaign_lifetime` + `clock_skew` ahead, so
+a pool's clock may run `clock_skew` fast. Both are whole seconds, and
+`campaign_lifetime` must be at least twice `clock_skew`, so a pool whose clock
+runs `clock_skew` slow still has `clock_skew` to start its upload. `GET /` is a
+page with that Campaign, its SHA-256 and `ukc send` instructions for the
+client build from the same commit; server and `ukc` versions move apart, and
+the page names both. `campaign` may use only `A-Z a-z 0-9 . _ -`. Both routes
+and `/healthz` also answer HEAD. Neither route touches S3 or the roster; both
+are rendered once at startup.
 
 The Key Roster format is
 `{"epoch": N, "slot": N, "pools": {"POOL_HEX": ["BLS_PUBLIC_KEY_HEX"]}}`.
@@ -159,16 +210,31 @@ network, campaign, bucket, region, and file paths for your service:
 The module runs under DynamicUser with private staging at
 `/var/lib/uketsuke/staging`, loopback HTTP and systemd confinement. The roster
 must be readable by that identity. Keep operational credentials out of the Nix
-store. Expose the listener through an HTTPS reverse proxy with aligned header,
-body and time limits and request buffering disabled. Reverse-proxy configuration,
-roster generation/refresh, bucket provisioning, and live AWS verification are
+store.
+
+Expose the listener through an HTTPS reverse proxy. `services.uketsuke.nginx.enable`
+adds an nginx virtual host named after the host in `settings.service`, which
+must then be `https://<host>` without port or path. It proxies everything to
+the listener over HTTP/1.1 with request buffering off, the recommended proxy
+headers, no `client_max_body_size` (the server refuses an oversized signed
+`file_size` with a JSON error before reading the body; nginx's own 413 is
+HTML), `proxy_send_timeout` set to `upload_timeout` and `proxy_read_timeout`
+to `nginx.responseTimeout` (default three `s3_timeout` for quota reservation,
+Bundle write and PUT, plus 60 s for staging), and a separate `= /healthz`
+location for probe limits. It asserts
+that `max_manifest_bytes` fits nginx's 8 KiB header line once base64-encoded.
+TLS, rate limits and firewall rules stay with the deployment; add them on
+`services.nginx.virtualHosts.<host>`. With another server, replicate those
+settings.
+
+Roster generation/refresh, bucket provisioning, and live AWS verification are
 operator responsibilities; this repository does not provision them.
 
 ## Observability
 
 `GET /healthz` on the public listener answers 200 with
 `{"status":"ready","roster":{"epoch":N,"slot":N,"pools":N,"age_secs":N}}`
-while the Key Roster is valid and within `roster_max_age_secs`, and 503 with
+while the Key Roster is valid and within `roster_max_age`, and 503 with
 `{"status":"unavailable","error":{"code":"roster_unavailable"}}` otherwise. It
 reads only the local roster, never S3, so probes cannot drive Archive cost. It
 reuses the last parse while the roster file's device, inode, mtime and size are
@@ -242,6 +308,11 @@ mix test
 zig build --build-file client/build.zig test
 nix build .#uketsuke .#ukc
 ```
+
+With `qemu-aarch64` on PATH, run the aarch64 client tests with
+`zig build --build-file client/build.zig test -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -fqemu --summary all`.
+To exercise the aarch64 release binary with the upload smoke suite below,
+set `UKC` to its path on a host with aarch64 binfmt support.
 
 `mix test` covers Manifest validation, real BLS authorization, Bundle round
 trips and malformed archives. S3 integration tests are
@@ -349,7 +420,7 @@ queue; clearing staging does not lose accepted Submissions.
 `quota.json` is a versioned, conditional-update ledger of immutable identities
 and original Receipts. It charges signed ZIP bytes before attempting Bundle
 publication. Concurrent updates use ETags; contention is bounded by
-`s3_timeout_ms`. A failed or uncertain publication retains its reservation:
+`s3_timeout`. A failed or uncertain publication retains its reservation:
 absence on a later HEAD cannot prove an earlier timed-out PUT will not land.
 Retry the same ID and immutable metadata to recover the held capacity. Holds
 are not automatically reclaimed. Recovering an existing Bundle only reads the

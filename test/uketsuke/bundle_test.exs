@@ -111,7 +111,7 @@ defmodule Uketsuke.BundleTest do
 
     oversized = original |> replace(124, "77777777777\0") |> rechecksum()
     File.write!(path, oversized)
-    assert_raise Error, ~r/exceeds the remaining/, fn -> Bundle.load!(path) end
+    assert_message("exceeds the remaining", fn -> Bundle.load!(path) end)
   end
 
   @tag :tmp_dir
@@ -119,7 +119,7 @@ defmodule Uketsuke.BundleTest do
     path = Bundle.create!(context.stage, context.auth, context.receipt)
     bytes = File.read!(path) |> replace(512, "X")
     File.write!(path, bytes)
-    assert_raise Error, ~r/SHA-256/, fn -> Bundle.load!(path) end
+    assert_message("SHA-256", fn -> Bundle.load!(path) end)
   end
 
   @tag :tmp_dir
@@ -152,15 +152,20 @@ defmodule Uketsuke.BundleTest do
   @tag :tmp_dir
   test "create checks projected receipt and streamed report rather than publishing corrupt evidence",
        context do
-    assert_raise Error, ~r/projection/, fn ->
+    assert_message("projection", fn ->
       Bundle.create!(context.stage, context.auth, Map.put(context.receipt, "file_size", 1))
-    end
+    end)
 
     File.write!(Path.join(context.stage, "report.zip"), "wrong bytes")
 
-    assert_raise Error, ~r/size/, fn ->
+    assert_message("size", fn ->
       Bundle.create!(context.stage, context.auth, context.receipt)
-    end
+    end)
+  end
+
+  defp assert_message(part, fun) do
+    error = assert_raise Error, fun
+    assert Exception.message(error) =~ part
   end
 
   defp replace(bytes, offset, replacement) do

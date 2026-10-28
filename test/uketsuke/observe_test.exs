@@ -4,7 +4,7 @@ defmodule Uketsuke.ObserveTest do
   import Plug.Test
   import Plug.Conn, only: [put_req_header: 3]
 
-  alias Uketsuke.{Config, JSONLog, Metrics, MetricsRouter, RequestLog, Router, Store}
+  alias Uketsuke.{Campaign, Config, JSONLog, Metrics, MetricsRouter, RequestLog, Router, Store}
 
   @pool String.duplicate("b", 56)
 
@@ -22,7 +22,8 @@ defmodule Uketsuke.ObserveTest do
     %{config: config}
   end
 
-  defp call(method, path, config), do: Router.call(conn(method, path), {config, nil})
+  defp call(method, path, config), do: call(conn(method, path), config)
+  defp call(conn, config), do: Router.call(conn, Router.init({config, nil}))
 
   defp scrape(config) do
     conn = MetricsRouter.call(conn(:get, "/metrics"), config)
@@ -37,7 +38,7 @@ defmodule Uketsuke.ObserveTest do
     assert %{"status" => "ready", "roster" => %{"epoch" => 7, "slot" => 9, "pools" => 1}} =
              Jason.decode!(conn.resp_body)
 
-    stale = System.system_time(:second) - config.roster_max_age_secs - 1
+    stale = System.system_time(:second) - div(config.roster_max_age_ms, 1000) - 1
     File.touch!(config.roster_path, stale)
     conn = call(:get, "/healthz", config)
     assert conn.status == 503
@@ -51,6 +52,56 @@ defmodule Uketsuke.ObserveTest do
     assert call(:get, "/healthz", config).status == 503
     assert call(:get, "/health", config).status == 404
   end
+
+  test "serves the Campaign JSON and the page announcing it, from config", %{config: config} do
+    conn = call(:get, "/campaigns/glue.json", config)
+    assert conn.status == 200
+    assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-cache"]
+
+    assert Jason.decode!(conn.resp_body) == %{
+             "service" => config.service,
+             "network" => config.network,
+             "campaign" => "glue",
+             "lifetime_secs" => div(config.campaign_lifetime_ms, 1000)
+           }
+
+    page = call(:get, "/", config)
+    assert page.status == 200
+    assert [type] = Plug.Conn.get_resp_header(page, "content-type")
+    assert type =~ "text/html"
+    sha = :crypto.hash(:sha256, conn.resp_body) |> Base.encode16(case: :lower)
+    assert page.resp_body =~ "SHA-256 <code>#{sha}</code>"
+    assert page.resp_body =~ "--campaign #{config.service}/campaigns/glue.json"
+    assert page.resp_body =~ "ukc-#{client_version()}-x86_64-linux"
+
+    capture_log(fn ->
+      assert call(:get, "/campaigns/other.json", config).status == 404
+      assert call(:put, "/", config).status == 404
+    end)
+  end
+
+  test "HEAD probes the public routes", %{config: config} do
+    for path <- ["/", "/campaigns/glue.json", "/healthz"] do
+      assert call(:head, path, config).status == 200
+    end
+  end
+
+  test "the page escapes configured strings", %{config: config} do
+    page = call(:get, "/", %{config | network: "<b>net</b>"}).resp_body
+    assert page =~ "&lt;b&gt;net&lt;/b&gt;"
+    refute page =~ "<b>net"
+  end
+
+  test "the page names the client version and the release that carries it", %{config: config} do
+    page = call(:get, "/", config).resp_body
+    assert page =~ "ukc-#{client_version()}-x86_64-linux"
+    assert page =~ "ukc #{client_version()}</a>"
+    assert page =~ "/releases/download/v#{Mix.Project.config()[:version]}"
+  end
+
+  # The client version is ukc's own and moves apart from the server's; the
+  # release tag in the download URL is the server's.
+  defp client_version, do: Campaign.client_version()
 
   defp request_messages(fun),
     do: fun |> JSONLog.capture() |> JSONLog.requests() |> Enum.map(& &1["message"])
@@ -125,7 +176,7 @@ defmodule Uketsuke.ObserveTest do
 
     assert [message] =
              request_messages(fn ->
-               assert {:noproc, _} = catch_exit(Router.call(conn, {config, nil}))
+               assert {:noproc, _} = catch_exit(call(conn, config))
              end)
 
     assert %{"outcome" => "rejected", "code" => "internal_error", "pool_id" => @pool} = message
@@ -182,7 +233,9 @@ defmodule Uketsuke.ObserveTest do
     assert body =~ "uketsuke_roster_ok 1\n"
     assert body =~ "uketsuke_roster_epoch 7\n"
     assert body =~ "uketsuke_roster_pools 1\n"
-    assert body =~ ~r/uketsuke_roster_mtime_seconds \d+\n/
+    assert [_, after_name] = String.split(body, "\nuketsuke_roster_mtime_seconds ", parts: 2)
+    assert {mtime, "\n" <> _} = Integer.parse(after_name)
+    assert mtime > 0
     # Absent until a ledger read: 0 would claim an empty ledger.
     refute body =~ "uketsuke_quota_reserved_bytes"
 

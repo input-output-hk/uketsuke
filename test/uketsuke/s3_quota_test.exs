@@ -185,7 +185,7 @@ defmodule Uketsuke.S3QuotaTest do
       S3.put!(%{s3 | endpoint: endpoint}, key, "real bundle bytes", :absent)
     end)
 
-    assert Task.await(proxy, 15_000) =~ ~r|^HTTP/1\.1 200 |
+    assert "HTTP/1.1 200 " <> _ = Task.await(proxy, 15_000)
     assert %{body: "real bundle bytes"} = S3.get!(s3, key)
     later = Manifest.receipt(manifest, "2026-10-09T12:00:00Z")
     assert Quota.reserve!(S3.new(config), config, manifest, later) == original
@@ -211,7 +211,7 @@ defmodule Uketsuke.S3QuotaTest do
     assert error.code == "storage_failed"
     assert System.monotonic_time(:millisecond) - started < 5000
     send(proxy.pid, :release_response)
-    assert Task.await(proxy, 15_000) =~ ~r|^HTTP/1\.1 200 |
+    assert "HTTP/1.1 200 " <> _ = Task.await(proxy, 15_000)
     assert %{body: "actual bytes"} = S3.get!(s3, key)
     assert Quota.reserve!(S3.new(config), config, manifest, receipt(manifest)) == original
   end
@@ -321,10 +321,15 @@ defmodule Uketsuke.S3QuotaTest do
   defp receive_request!(socket, bytes) do
     case :binary.match(bytes, "\r\n\r\n") do
       {offset, 4} ->
-        headers = binary_part(bytes, 0, offset)
-        [_, length] = Regex.run(~r/(?:^|\r\n)content-length:\s*(\d+)/i, headers)
+        [_request_line | headers] = bytes |> binary_part(0, offset) |> String.split("\r\n")
 
-        if byte_size(bytes) >= offset + 4 + String.to_integer(length) do
+        [length] =
+          for header <- headers,
+              [name, value] <- [String.split(header, ":", parts: 2)],
+              String.downcase(name) == "content-length",
+              do: value |> String.trim() |> String.to_integer()
+
+        if byte_size(bytes) >= offset + 4 + length do
           bytes
         else
           {:ok, chunk} = :gen_tcp.recv(socket, 0, 10_000)

@@ -25,6 +25,11 @@ defmodule Uketsuke.DomainTest do
     }
   end
 
+  defp assert_message(part, fun) do
+    error = assert_raise ArgumentError, fun
+    assert Exception.message(error) =~ part
+  end
+
   defp expect_code(code, fun) do
     error = assert_raise Error, fun
     assert error.code == code
@@ -36,11 +41,57 @@ defmodule Uketsuke.DomainTest do
     assert config.roster_path == "/tmp/uketsuke-domain/roster.json"
     assert config.max_encoded_manifest_bytes == 10_924
     assert config.max_header_bytes == byte_size("x-upload-manifest: \r\n") + 10_924
+    assert config.campaign_lifetime_ms == 600_000
+    assert config.clock_skew_ms == 300_000
+    assert config.upload_timeout_ms == 120_000
+    assert config.roster_max_age_ms == 3_600_000
+    assert config.s3_timeout_ms == 30_000
+    assert Config.max_lifetime_secs(config) == 900
+  end
+
+  test "configuration rejects campaigns that cannot be served or signed" do
+    for campaign <- ["a/b", "glue json", "über"] do
+      assert_message(~s(campaign must use only), fn ->
+        from_map!(Map.put(config_map(), "campaign", campaign))
+      end)
+    end
+
+    assert_message("at least twice clock_skew", fn ->
+      from_map!(Map.put(config_map(), "campaign_lifetime", "599s"))
+    end)
+
+    assert_message("whole seconds", fn ->
+      from_map!(Map.put(config_map(), "clock_skew", "1500ms"))
+    end)
+
+    assert from_map!(Map.put(config_map(), "campaign_lifetime", "600s")).campaign_lifetime_ms ==
+             600_000
+  end
+
+  test "configuration keeps progress_interval under ukc's stall limit" do
+    assert from_map!(Map.put(config_map(), "progress_interval", "59s")).progress_interval_ms ==
+             59_000
+
+    assert_message("under ukc's 60 s stall limit", fn ->
+      from_map!(Map.put(config_map(), "progress_interval", "1m"))
+    end)
+  end
+
+  test "configuration parses durations by unit and refuses anything else" do
+    for {text, ms} <- [{"250ms", 250}, {"30s", 30_000}, {"2m", 120_000}, {"1h", 3_600_000}] do
+      assert from_map!(Map.put(config_map(), "s3_timeout", text)).s3_timeout_ms == ms
+    end
+
+    for bad <- ["30", "0s", "05s", "-5s", "+5s", "5 s", "5S", "5d", "1.5s", "s", "", 30_000, nil] do
+      assert_message("s3_timeout must be a duration", fn ->
+        from_map!(Map.put(config_map(), "s3_timeout", bad))
+      end)
+    end
   end
 
   test "configuration requires every key and rejects unsafe storage destinations" do
     assert_raise ArgumentError, fn ->
-      from_map!(Map.delete(config_map(), "s3_timeout_ms"))
+      from_map!(Map.delete(config_map(), "s3_timeout"))
     end
 
     assert_raise ArgumentError, fn ->
@@ -70,11 +121,34 @@ defmodule Uketsuke.DomainTest do
           "inboxes/./",
           "inboxes//",
           "inboxes",
-          "inboxes/%2f/"
+          "inboxes/%2f/",
+          "inboxes/.hidden/"
         ] do
       assert_raise ArgumentError, fn ->
         from_map!(Map.put(config_map(), "s3_prefix", prefix))
       end
+    end
+
+    assert from_map!(Map.put(config_map(), "s3_prefix", "a_b/c-d.e/")).s3_prefix == "a_b/c-d.e/"
+
+    for bucket <- [
+          "ab",
+          String.duplicate("a", 64),
+          "-ab",
+          "ab-",
+          "a..b",
+          "a.-b",
+          "a-.b",
+          "aBc",
+          "a_b"
+        ] do
+      assert_raise ArgumentError, fn ->
+        from_map!(Map.put(config_map(), "s3_bucket", bucket))
+      end
+    end
+
+    for bucket <- ["abc", String.duplicate("a", 63), "a.b-c9"] do
+      assert from_map!(Map.put(config_map(), "s3_bucket", bucket)).s3_bucket == bucket
     end
 
     for endpoint <- [
@@ -232,7 +306,7 @@ defmodule Uketsuke.DomainTest do
     config = %{config() | roster_path: path}
     File.write!(path, Jason.encode!(%{"epoch" => 1, "slot" => 2, "pools" => %{@pool => [key]}}))
     assert Auth.authorize!(auth, config).roster == %{epoch: 1, slot: 2}
-    File.touch!(path, System.system_time(:second) - config.roster_max_age_secs - 1)
+    File.touch!(path, System.system_time(:second) - div(config.roster_max_age_ms, 1000) - 1)
     expect_code("roster_unavailable", fn -> Auth.authorize!(auth, config) end)
     File.touch!(path, System.system_time(:second) + 60)
     expect_code("roster_unavailable", fn -> Auth.authorize!(auth, config) end)

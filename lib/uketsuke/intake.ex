@@ -21,17 +21,68 @@ defmodule Uketsuke.Intake do
         :missing ->
           conn = receive_report!(conn, auth.manifest, stage, deadline)
           Store.body_complete!(token)
-          receipt = Manifest.receipt(auth.manifest, DateTime.utc_now() |> DateTime.to_iso8601())
-          path = Bundle.create!(stage, auth, receipt)
-          {disposition, receipt} = publish!(s3, config, auth, stage, receipt, path)
+
+          {conn, {disposition, receipt}} =
+            with_progress(conn, config, fn ->
+              receipt =
+                Manifest.receipt(auth.manifest, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              path = Bundle.create!(stage, auth, receipt)
+              publish!(s3, config, auth, stage, receipt, path)
+            end)
+
           {conn, disposition, receipt}
 
         _existing ->
           Store.body_complete!(token)
-          receipt = recover!(s3, config, auth.manifest, stage)
+
+          {conn, receipt} =
+            with_progress(conn, config, fn -> recover!(s3, config, auth.manifest, stage) end)
+
           {conn, :existing, receipt}
       end
     end)
+  end
+
+  # Bundle writing and S3 calls answer nothing until the receipt, longer than
+  # ukc's stall limit allows, so a 103 every progress_interval shows the request
+  # is alive. inform/3 must run in the process that owns the connection, hence
+  # the task. A failure inside it is raised here, where Router expects it.
+  # nginx drops a 103 whose only header is one it hides, such as date.
+  @progress_headers [{"x-upload-stage", "publishing"}]
+
+  def with_progress(conn, config, fun) do
+    task =
+      Task.async(fn ->
+        try do
+          {:ok, fun.()}
+        catch
+          kind, reason -> {:failed, kind, reason, __STACKTRACE__}
+        end
+      end)
+
+    case await_progress(conn, task, config.progress_interval_ms) do
+      {conn, {:ok, value}} -> {conn, value}
+      {_conn, {:failed, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp await_progress(conn, task, interval) do
+    case Task.yield(task, interval) do
+      {:ok, outcome} ->
+        {conn, outcome}
+
+      nil ->
+        try do
+          Plug.Conn.inform(conn, 103, @progress_headers)
+        rescue
+          # The client left: publication still finishes, so a retry with the
+          # same id recovers its receipt, and the final send reports the loss.
+          Bandit.TransportError -> {conn, Task.await(task, :infinity)}
+        else
+          conn -> await_progress(conn, task, interval)
+        end
+    end
   end
 
   def object_key(config, id), do: config.s3_prefix <> "submissions/" <> id <> ".tar"

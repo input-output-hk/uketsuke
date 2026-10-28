@@ -196,11 +196,16 @@ fn options(content_type: http.Client.Request.Headers.Value, headers: []const htt
 }
 
 fn receive(req: *http.Client.Request, progress: *Progress, arena: std.mem.Allocator, limit: usize, url: []const u8, d: *Diagnostic) !Answer {
-    var response = req.receiveHead(&.{}) catch |err| {
-        const cause = if (err == error.ReadFailed) req.connection.?.getReadError() orelse err else err;
-        return d.fail("no answer from {s}: {s}", .{ url, @errorName(cause) });
+    // The server sends 103 Early Hints while it publishes, so a slow archive
+    // write is progress, not a stall.
+    var response = while (true) {
+        const head = req.receiveHead(&.{}) catch |err| {
+            const cause = if (err == error.ReadFailed) req.connection.?.getReadError() orelse err else err;
+            return d.fail("no answer from {s}: {s}", .{ url, @errorName(cause) });
+        };
+        progress.mark();
+        if (head.head.status != .early_hints) break head;
     };
-    progress.mark();
     const status = response.head.status;
     const window: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
@@ -289,6 +294,48 @@ test "an upload to a peer that stops reading is canceled after the stall limit" 
         std.debug.print("canceling took {d} ms\n", .{elapsed});
         return err;
     };
+}
+
+/// Answers one request after `hints` 103 Early Hints, each `gap` apart.
+fn answerAfterHints(io: Io, server: *Io.net.Server, hints: usize, gap: Io.Duration) !void {
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    while (!std.mem.eql(u8, try reader.interface.takeDelimiterInclusive('\n'), "\r\n")) {}
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    for (0..hints) |_| {
+        try io.sleep(gap, .awake);
+        try writer.interface.writeAll("HTTP/1.1 103 Early Hints\r\n\r\n");
+        try writer.interface.flush();
+    }
+    try writer.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+    try writer.interface.flush();
+}
+
+test "103 Early Hints keep a slow answer alive past the stall limit" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{ .arena = arena.allocator() };
+    const address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/c.json", .{server.socket.address.getPort()});
+    // Five hints 100 ms apart: 500 ms in all, twice the stall limit.
+    var answering = try io.concurrent(answerAfterHints, .{ io, &server, 5, .fromMilliseconds(100) });
+    defer answering.cancel(io) catch {};
+
+    var client: http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+    const limits: Limits = .{ .connect = .fromSeconds(5), .stall = .fromMilliseconds(250) };
+    const body = fetchCampaign(&client, arena.allocator(), url, 1024, limits, &d) catch |err| {
+        std.debug.print("{s}\n", .{d.message});
+        return err;
+    };
+    try testing.expectEqualStrings("{}", body);
+    try answering.await(io);
 }
 
 test "the watchdog applies the connect limit until the first progress mark" {

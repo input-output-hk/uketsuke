@@ -4,7 +4,7 @@ defmodule Uketsuke.Roster do
   @enforce_keys [:epoch, :slot, :pools, :mtime]
   defstruct @enforce_keys
 
-  # A Key Roster snapshot whose file mtime is within roster_max_age_secs.
+  # A Key Roster snapshot whose file mtime is within roster_max_age.
   # :parse decodes the file every time; authorization uses it. :cached reuses
   # the last decode while the opened file's device, inode, mtime and size are
   # unchanged, so public /healthz probes and scrapes cost a stat, not a parse.
@@ -22,7 +22,7 @@ defmodule Uketsuke.Roster do
 
   def fresh?(%__MODULE__{} = roster, config) do
     age = age_secs(roster)
-    age >= 0 and age <= config.roster_max_age_secs
+    age >= 0 and age * 1000 <= config.roster_max_age_ms
   end
 
   # Negative for a future mtime, which fresh?/2 rejects.

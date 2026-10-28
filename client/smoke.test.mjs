@@ -202,14 +202,15 @@ await test('real signed uploads: ukc, curl, Elixir/blst, and S3 Archive', { time
     type: 'BlsSigningKey_bls12-381-BLS-Signature-Minimal-Signature-Size', cborHex: `5820${hex(secret)}`,
   }), { mode: 0o600 });
   await writeFile(join(dir, 'campaign.json'), JSON.stringify(campaign));
+  const rosterMaxAgeSecs = 3600;
   const config = {
     port, metrics_port: 0, service, network: campaign.network, campaign: campaign.campaign,
     staging_dir: staging, roster_path: rosterPath,
     max_file_bytes: report.length * 2, max_total_bytes: report.length * 5,
-    max_inflight: 2, max_manifest_bytes: 4096, max_lifetime_secs: 3600,
-    upload_timeout_ms: 2000, roster_max_age_secs: 3600,
+    max_inflight: 2, max_manifest_bytes: 4096, campaign_lifetime: '55m', clock_skew: '5m',
+    upload_timeout: '2s', roster_max_age: `${rosterMaxAgeSecs}s`,
     s3_bucket: bucket, s3_region: region, s3_endpoint: endpoint,
-    s3_prefix: `uketsuke/v1/smoke-${freshId()}/`, s3_timeout_ms: 10000,
+    s3_prefix: `uketsuke/v1/smoke-${freshId()}/`, s3_timeout: '10s', progress_interval: '15s',
   };
   await writeFile(configPath, JSON.stringify(config));
 
@@ -354,7 +355,8 @@ await test('real signed uploads: ukc, curl, Elixir/blst, and S3 Archive', { time
     assert.equal(sent.file_hash, digest);
     assert.match(result.stderr, new RegExp(`^submission ${sent.submission_id}: uploading ${report.length} bytes to ${literal(service)}\n$`));
     assert.deepEqual(archiveEntry(sent.submission_id).receipt, sent);
-    const retry = await send('--pool', pool, '--campaign', join(dir, 'campaign.json'), '--id', sent.submission_id);
+    // The retry fetches the Campaign the server serves for itself.
+    const retry = await send('--pool', pool, '--campaign', `${service}/campaigns/glue.json`, '--id', sent.submission_id);
     assert.equal(retry.status, 0, retry.stderr);
     assert.deepEqual(JSON.parse(retry.stdout), sent);
   });
@@ -508,7 +510,7 @@ await test('real signed uploads: ukc, curl, Elixir/blst, and S3 Archive', { time
     assert.ok(!keys().includes(objectKey(stalled.submission_id)));
   });
   await t.test('stale Key Roster refuses admission', async () => {
-    const old = new Date(Date.now() - (config.roster_max_age_secs + 60) * 1000);
+    const old = new Date(Date.now() - (rosterMaxAgeSecs + 60) * 1000);
     await utimes(rosterPath, old, old);
     try { await rejected(manifest(), 503); }
     finally { await writeFile(rosterPath, roster); }

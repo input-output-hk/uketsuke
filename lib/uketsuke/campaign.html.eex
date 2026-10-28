@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uketsuke · <%= v.network %></title>
+<style>
+  :root { color-scheme: light dark; --fg: #1c1c1c; --bg: #fafaf8; --muted: #666; --line: #ddd; --code: #f0efea; --accent: #0b6e4f; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e4; --bg: #161616; --muted: #9a9a9a; --line: #333; --code: #222; --accent: #5ccf9f; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, sans-serif; }
+  main { max-width: 50rem; margin: 0 auto; padding: 2.5rem 1rem 4rem; }
+  h1 { margin: 0; font-size: 1.9rem; }
+  h1 small { color: var(--muted); font-weight: 400; font-size: 1rem; margin-left: .5rem; }
+  h2 { margin-top: 2.2rem; font-size: 1.15rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  a { color: var(--accent); }
+  code, pre { font: .9em/1.5 ui-monospace, monospace; background: var(--code); border-radius: 4px; }
+  code { padding: .1em .3em; overflow-wrap: anywhere; }
+  pre { padding: .8rem 1rem; overflow-x: auto; font-size: .82em; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .4rem .6rem .4rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; width: 11rem; }
+  .download { margin-top: 1rem; }
+  ol { padding-left: 1.4rem; }
+  li { margin-bottom: 1rem; }
+  li pre { margin: .5rem 0; }
+  .muted { color: var(--muted); }
+</style>
+<main>
+  <h1>Uketsuke <small>受付, reception desk</small></h1>
+  <p>The report inbox for network <code><%= v.network %></code>. A pool signs a ZIP report locally with its BLS key and uploads it here. The signing key never leaves the pool's machine, and each accepted report gets a receipt.</p>
+
+  <h2>Current campaign</h2>
+  <table>
+    <tr><th>Campaign</th><td><code><%= v.campaign %></code></td></tr>
+    <tr><th>Network</th><td><code><%= v.network %></code></td></tr>
+    <tr><th>Service</th><td><code><%= v.service %></code></td></tr>
+    <tr><th>Request lifetime</th><td><%= v.lifetime_secs %> s from signing</td></tr>
+    <tr><th>Largest report</th><td><%= v.max_file %></td></tr>
+    <tr><th>Accepted keys</th><td>Pool BLS keys in the service's key roster</td></tr>
+    <tr><th>Client</th><td><a href="<%= v.repo %>/releases/tag/<%= v.tag %>">ukc <%= v.client_version %></a></td></tr>
+  </table>
+  <p class="download"><a href="<%= v.campaign_path %>">Download <%= v.campaign %>.json</a> <span class="muted">· <a href="/healthz">service status</a></span></p>
+  <p class="muted">SHA-256 <code><%= v.sha256 %></code></p>
+
+  <h2>Upload a report</h2>
+  <p><code>POOL_HEX</code> is your pool's 56-character lowercase hex ID. <code>ukc send</code> fetches the campaign, signs the report locally and uploads it, then prints the receipt.</p>
+  <ol>
+    <li>Sign and upload, with Nix:
+      <pre>nix run github:input-output-hk/uketsuke/<%= v.tag %>#ukc -- \
+  send --key /secure/path/bls.skey --file report.zip --pool POOL_HEX \
+  --campaign <%= v.campaign_url %> &gt; receipt.json</pre>
+      or without Nix, with the release's static binary:
+      <pre>release=<%= v.release %>
+curl -fsSLO $release/<%= v.binary %>
+curl -fsSLO $release/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+chmod +x <%= v.binary %>
+./<%= v.binary %> \
+  send --key /secure/path/bls.skey --file report.zip --pool POOL_HEX \
+  --campaign <%= v.campaign_url %> &gt; receipt.json</pre>
+      <p class="muted">On aarch64 use <code>ukc-<%= v.client_version %>-aarch64-linux</code>.</p></li>
+    <li>Keep <code>receipt.json</code>. If the upload fails, rerun the same command with <code>--id SUBMISSION_ID</code>, printed to stderr, and the unchanged report.</li>
+  </ol>
+  <p>To sign on a host without network access, use <code>ukc sign</code> and upload with curl; see <a href="<%= v.repo %>/blob/<%= v.tag %>/docs/reference.md#ukc-sign-and-curl">ukc sign and curl</a>. Expiry, receipt recovery and error responses are in the <a href="<%= v.repo %>/blob/<%= v.tag %>/docs/reference.md#upload-details">upload details</a>.</p>
+</main>
+</html>

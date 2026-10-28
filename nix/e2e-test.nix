@@ -65,6 +65,16 @@ let
     fi
     exec ${pkgs.nodejs_24}/bin/node ${client}/nix/module-smoke.mjs "$@"
   '';
+  # Stands in for a slow publish: three 103s a second apart, then the answer.
+  hintingUpstream = pkgs.writeShellScript "hinting-upstream" ''
+    set -euo pipefail
+    while IFS= read -r line && [ "$line" != $'\r' ]; do :; done
+    for _ in 1 2 3; do
+      printf 'HTTP/1.1 103 Early Hints\r\nx-upload-stage: publishing\r\n\r\n'
+      ${pkgs.coreutils}/bin/sleep 1
+    done
+    printf 'HTTP/1.1 201 Created\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}'
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "uketsuke-floci";
@@ -121,9 +131,43 @@ pkgs.testers.runNixOSTest {
       };
       systemd.services.uketsuke.wantedBy = pkgs.lib.mkForce [ ];
     };
+  # No archive and no roster: it checks what nginx forwards and refuses itself;
+  # uketsuke answers the page and Campaign from config alone.
+  nodes.proxy =
+    { ... }:
+    {
+      imports = [ module ];
+      environment.systemPackages = [ pkgs.socat ];
+      environment.etc."uketsuke-aws-env".text = ''
+        AWS_ACCESS_KEY_ID=unused
+        AWS_SECRET_ACCESS_KEY=unused
+      '';
+      services.uketsuke = {
+        enable = true;
+        inherit package;
+        environmentFile = "/etc/uketsuke-aws-env";
+        rosterFile = "/var/lib/uketsuke-roster.json";
+        nginx.enable = true;
+        settings = {
+          service = "https://inbox.test";
+          network = "proxy-network";
+          campaign = "proxied";
+          s3_bucket = "uketsuke";
+          s3_region = region;
+          s3_endpoint = "http://127.0.0.1:1";
+          s3_prefix = "uketsuke/v1/proxied/";
+          metrics_port = 4001;
+          max_file_bytes = 3000;
+          # The largest the module's assertion admits: an 8189-byte header line.
+          max_manifest_bytes = 6126;
+        };
+      };
+    };
   testScript = ''
+    import base64
     import json
-    from datetime import timedelta
+    import time
+    from datetime import datetime, timedelta
     start_all()
     inbox.wait_for_unit("floci.service")
     inbox.wait_for_open_port(4566, addr="127.0.0.1")
@@ -180,6 +224,52 @@ pkgs.testers.runNixOSTest {
         print(inbox.succeed("floci-auth-check"))
         print(inbox.succeed("uketsuke-smoke restart"))
         print(inbox.succeed("uketsuke-smoke quota"))
+    with subtest("nginx vhost proxies the campaign page and the API"):
+        proxy.wait_for_unit("nginx.service")
+        proxy.wait_for_open_port(4000, addr="127.0.0.1")
+        curl = "curl -s -H 'Host: inbox.test' http://127.0.0.1"
+        campaign = json.loads(proxy.succeed(f"{curl}/campaigns/proxied.json"))
+        assert campaign == {"service": "https://inbox.test", "network": "proxy-network",
+                            "campaign": "proxied", "lifetime_secs": 3300}, campaign
+        page = proxy.succeed(f"{curl}/")
+        sha = proxy.succeed(f"{curl}/campaigns/proxied.json | sha256sum").split()[0]
+        for text in ["https://inbox.test/campaigns/proxied.json", f"SHA-256 <code>{sha}</code>", "<code>proxy-network</code>"]:
+            assert text in page, text
+        assert "no-cache" in proxy.succeed(f"{curl}/ -o /dev/null -D -")
+        health = proxy.succeed(f"{curl}/healthz -w '%{{http_code}}'")
+        assert health.endswith("503") and "roster_unavailable" in health, health
+        unrouted = proxy.succeed(f"{curl}/v1/nothing -w '%{{http_code}}'")
+        assert unrouted.endswith("404") and '"not_found"' in unrouted, unrouted
+        assert proxy.succeed(f"{curl}/ -I -o /dev/null -w '%{{http_code}}'") == "200"
+        # A manifest padded to max_manifest_bytes reaches the server through
+        # nginx's header limit, and an oversized report gets the server's JSON
+        # refusal, which ukc reads, not nginx's HTML 413.
+        manifest = json.dumps({
+            "protocol": "leios-artifact-upload/v1", "service": "https://inbox.test",
+            "network": "proxy-network", "campaign": "proxied", "pool_id": "ab" * 28,
+            "submission_id": "10" * 16, "file_hash": "00" * 32, "file_size": 3001,
+            "filename": "report.zip", "expires_at": int(time.time()) + 600,
+        })
+        manifest = base64.b64encode(manifest.ljust(6126).encode()).decode()
+        proxy.succeed("head -c 3001 /dev/zero > /tmp/big")
+        big = proxy.succeed(f"{curl}/v1/uploads/{'10' * 16} -H 'x-upload-manifest: {manifest}' -T /tmp/big -w '%{{http_code}}'")
+        assert big.endswith("413") and '"file_too_large"' in big, big
+    with subtest("nginx passes the server's 103 heartbeats to the client"):
+        proxy.succeed("systemctl stop uketsuke")
+        proxy.succeed("systemd-run --unit hinting socat TCP-LISTEN:4000,bind=127.0.0.1,reuseaddr,fork EXEC:${hintingUpstream}")
+        proxy.wait_for_open_port(4000, addr="127.0.0.1")
+        hinted = proxy.succeed(f"{curl}/v1/receipts/{'10' * 16} -v --trace-time -w '\\n%{{time_total}}' 2>&1")
+        assert hinted.count("< HTTP/1.1 103 Early Hints") == 3, hinted
+        assert "< HTTP/1.1 201 Created" in hinted, hinted
+        elapsed = float(hinted.splitlines()[-1])
+        assert elapsed >= 3, hinted
+        response_times = [datetime.strptime(line.split()[0], "%H:%M:%S.%f")
+                          for line in hinted.splitlines() if "< HTTP/1.1 " in line]
+        assert len(response_times) == 4, hinted
+        gaps = [(later - earlier).total_seconds() % 86400
+                for earlier, later in zip(response_times, response_times[1:])]
+        assert all(gap >= 0.9 for gap in gaps), hinted
+        print(f"nginx forwarded three 103 responses and the final 201 in {elapsed:.3f} s; gaps: {gaps}")
     print("UKETSUKE_FLOCI_SMOKE_PASSED")
   '';
 }

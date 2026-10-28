@@ -2,7 +2,7 @@ defmodule Uketsuke.Router do
   @behaviour Plug
   import Plug.Conn
   require Logger
-  alias Uketsuke.{Auth, Error, Intake, Metrics, RequestLog, Roster}
+  alias Uketsuke.{Auth, Campaign, Error, Intake, Metrics, RequestLog, Roster}
 
   @statuses %{
     "invalid_id" => 400,
@@ -47,20 +47,29 @@ defmodule Uketsuke.Router do
     "verifier_unavailable" => "signature verifier is unavailable"
   }
 
-  @impl true
-  def init(config), do: config
+  # Uptime checkers and `curl -I` probe with HEAD; Bandit sends no body for it.
+  @probe_methods ["GET", "HEAD"]
 
   @impl true
-  def call(conn, {config, _s3} = context) do
+  def init({config, s3}), do: {config, s3, Campaign.new(config)}
+
+  @impl true
+  def call(conn, {config, s3, %Campaign{file: campaign_file} = campaign}) do
     case {conn.method, conn.path_info} do
-      {"GET", ["healthz"]} ->
+      {method, ["healthz"]} when method in @probe_methods ->
         health(conn, config)
 
+      {method, []} when method in @probe_methods ->
+        public(conn, "text/html", campaign.page)
+
+      {method, ["campaigns", ^campaign_file]} when method in @probe_methods ->
+        public(conn, "application/json", campaign.json)
+
       {"PUT", ["v1", "uploads", id]} ->
-        request(conn, id, :upload, context)
+        request(conn, id, :upload, {config, s3})
 
       {"GET", ["v1", "receipts", id]} ->
-        request(conn, id, :receipt, context)
+        request(conn, id, :receipt, {config, s3})
 
       _ ->
         Metrics.unrouted()
@@ -168,6 +177,14 @@ defmodule Uketsuke.Router do
     kind, reason ->
       RequestLog.finish(log, {:rejected, "internal_error"}, nil)
       :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  # Built from config at init: no S3 call and no roster read.
+  defp public(conn, type, body) do
+    conn
+    |> put_resp_content_type(type)
+    |> put_resp_header("cache-control", "no-cache")
+    |> send_resp(200, body)
   end
 
   defp rejected(code, status, message),

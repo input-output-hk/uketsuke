@@ -7,6 +7,8 @@ let
       ../mix.exs
       ../mix.lock
       ../lib
+      # Campaign reads the client version from here at compile time.
+      ../client/build.zig.zon
     ];
   };
   # Hex's outer archive SHA-256 is already pinned in mix.lock. Fail on any
@@ -31,9 +33,7 @@ let
       }
   ) entries;
   # mix.exs is the one place the server version is written.
-  version = builtins.head (
-    builtins.match ''.*version: "([^"]+)".*'' (builtins.readFile ../mix.exs)
-  );
+  version = builtins.head (builtins.match ''.*version: "([^"]+)".*'' (builtins.readFile ../mix.exs));
   deps = pkgs.runCommand "uketsuke-pinned-mix-deps" { } (
     ''
       mkdir -p "$out"

@@ -159,7 +159,7 @@ defmodule Uketsuke.Metrics do
       gauge("uketsuke_quota_max_bytes", "Configured max_total_bytes.", config.max_total_bytes),
       gauge(
         "uketsuke_roster_ok",
-        "1 when the Key Roster is valid and within roster_max_age_secs.",
+        "1 when the Key Roster is valid and within roster_max_age.",
         if(roster_ok, do: 1, else: 0)
       ),
       roster_details

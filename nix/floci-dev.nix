@@ -75,7 +75,7 @@ pkgs.writeShellApplication {
     In another terminal (Nushell):
       open $state/env.json | load-env
     Server config: s3_endpoint=$endpoint, s3_bucket=uketsuke,
-    s3_region=us-east-1, s3_prefix=uketsuke/v1/dev/, s3_timeout_ms=30000.
+    s3_region=us-east-1, s3_prefix=uketsuke/v1/dev/, s3_timeout=30s.
     Stop with Ctrl-C. Objects and credentials remain in $state.
     EOF
     wait "$server"

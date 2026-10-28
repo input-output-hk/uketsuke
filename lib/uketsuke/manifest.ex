@@ -1,5 +1,5 @@
 defmodule Uketsuke.Manifest do
-  alias Uketsuke.Error
+  alias Uketsuke.{Config, Error}
 
   @fields ~w(protocol service network campaign pool_id submission_id file_hash file_size filename expires_at)
   @receipt_fields ~w(submission_id file_hash file_size pool_id filename)
@@ -47,7 +47,7 @@ defmodule Uketsuke.Manifest do
     Error.require!(fields["expires_at"] > now, "expired_manifest", "manifest has expired")
 
     Error.require!(
-      fields["expires_at"] <= now + config.max_lifetime_secs,
+      fields["expires_at"] <= now + Config.max_lifetime_secs(config),
       "expiry_too_far",
       "manifest lifetime exceeds configured limit"
     )
@@ -141,7 +141,12 @@ defmodule Uketsuke.Manifest do
     |> Map.merge(%{"durability" => "s3", "stored_at" => stored_at})
   end
 
-  def hex?(value, size) do
-    is_binary(value) and byte_size(value) == size and Regex.match?(~r/\A[0-9a-f]+\z/, value)
-  end
+  def hex?(value, size) when is_binary(value) and size > 0 and byte_size(value) == size,
+    do: lower_hex?(value)
+
+  def hex?(_value, _size), do: false
+
+  defp lower_hex?(<<c, rest::binary>>) when c in ?0..?9 or c in ?a..?f, do: lower_hex?(rest)
+  defp lower_hex?(<<>>), do: true
+  defp lower_hex?(_), do: false
 end

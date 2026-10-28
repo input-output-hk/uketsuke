@@ -226,13 +226,17 @@ defmodule Uketsuke.Bundle do
     value = bytes |> String.trim() |> String.trim(<<0>>) |> String.trim()
 
     Error.require!(
-      Regex.match?(~r/\A[0-7]+\z/, value),
+      value != "" and octal_digits?(value),
       "storage_failed",
       "tar header has an invalid octal number"
     )
 
     String.to_integer(value, 8)
   end
+
+  defp octal_digits?(<<c, rest::binary>>) when c in ?0..?7, do: octal_digits?(rest)
+  defp octal_digits?(<<>>), do: true
+  defp octal_digits?(_), do: false
 
   defp text_field!(bytes) do
     case :binary.split(bytes, <<0>>) do

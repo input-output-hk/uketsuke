@@ -6,10 +6,14 @@ an immutable S3 archive. Signing happens locally; private keys are never sent.
 
 Uketsuke runs at <https://uketsuke-leios.play.dev.cardano.org> for the Leios
 testnet `leios-164`. Sign only with the Leios key registered for your pool on
-that testnet, never a cold key. From release 1.1.0, static `ukc` client
-binaries are built for Linux x86-64 and aarch64; aarch64 execution is not
-smoke-tested. Release 1.0.0 ships the older `uketsuke-sign`, which has no
-`send` command.
+that testnet, never a cold key. From release 1.2.0 the service publishes its
+own campaign: its root page shows the current campaign, that campaign's
+SHA-256, the `ukc` version it ships and the `ukc send` command. Server and
+`ukc` are versioned apart, so a server release does not renumber the client.
+Static `ukc` client binaries are built for Linux x86-64 and aarch64 from
+release 1.1.0; the aarch64 client passes its tests and upload smoke suite under
+QEMU user emulation. Release 1.0.0 ships the
+older `uketsuke-sign`, which has no `send` command.
 
 ## Upload a report
 
@@ -24,10 +28,12 @@ nix run .#ukc -- send --key /secure/path/bls.skey --file report.zip --pool POOL_
 ```
 
 `ukc send` reads the campaign (fetching it when given a URL), signs the report
-locally and uploads it. It prints the receipt; save it. Take the campaign URL,
-or a `campaign.json` file, from the service operator's announcement. For hosts
-without Nix, obtain the matching static `ukc` binary (release 1.1.0 or later)
-and `SHA256SUMS` from an operator-approved
+locally and uploads it. It prints the receipt; save it. A 1.2.0 or later
+service serves its campaign at `/campaigns/<campaign>.json`; use the campaign
+URL its root page gives you, or a `campaign.json` file from the service
+operator. For hosts
+without Nix, obtain the static `ukc` binary (1.2.0 or later, named on the
+service's root page) and `SHA256SUMS` from an operator-approved
 [release](https://github.com/input-output-hk/uketsuke/releases). Verify it as
 described in [Release builds](docs/reference.md#release-builds), then replace
 `nix run .#ukc --` with the binary's path. If no release assets are available

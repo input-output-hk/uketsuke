@@ -49,7 +49,7 @@ defmodule Uketsuke.Store do
     File.chmod!(config.staging_dir, 0o700)
 
     Enum.each(File.ls!(config.staging_dir), fn name ->
-      unless Regex.match?(~r/\A[0-9a-f]{32}-[0-9a-f]{32}\z/, name) do
+      unless staging_entry?(name) do
         raise "unrecognized staging entry: #{name}; refusing to remove it"
       end
 
@@ -59,6 +59,11 @@ defmodule Uketsuke.Store do
     Metrics.inflight(0)
     {:ok, %{config: config, active: %{}}}
   end
+
+  defp staging_entry?(<<id::binary-size(32), ?-, nonce::binary-size(32)>>),
+    do: Manifest.hex?(id, 32) and Manifest.hex?(nonce, 32)
+
+  defp staging_entry?(_name), do: false
 
   @impl true
   def handle_call({:reserve, id, deadline, on_kill}, {pid, _}, state) do

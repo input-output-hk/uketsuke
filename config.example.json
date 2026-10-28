@@ -10,12 +10,14 @@
   "max_total_bytes": 1073741824,
   "max_inflight": 4,
   "max_manifest_bytes": 8192,
-  "max_lifetime_secs": 900,
-  "upload_timeout_ms": 120000,
-  "roster_max_age_secs": 3600,
+  "campaign_lifetime": "10m",
+  "clock_skew": "5m",
+  "upload_timeout": "2m",
+  "roster_max_age": "1h",
   "s3_bucket": "cardano-playground-metsuke",
   "s3_region": "eu-central-1",
   "s3_endpoint": "https://s3.eu-central-1.amazonaws.com",
   "s3_prefix": "uketsuke/v1/glue/",
-  "s3_timeout_ms": 30000
+  "s3_timeout": "30s",
+  "progress_interval": "15s"
 }
