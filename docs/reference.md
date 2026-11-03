@@ -326,9 +326,10 @@ server that never answers and of an upload to a peer that stops reading.
 **Backend prerequisite:** the Archive needs atomic `If-None-Match: *` and
 `If-Match` PUT semantics. Production uses AWS S3. Development and the NixOS
 smoke use [Floci](https://github.com/floci-io/floci) 2.2.0 (MIT), whose native
-server is taken from the image pinned by
-[floci-nix](https://github.com/imxade/floci-nix) and runs without a container
-runtime. Garage ignores those conditions and cannot back this service; see
+server is extracted from the official `floci/floci` image, pinned by digest and
+per-platform archive hash in [`nix/floci.nix`](../nix/floci.nix), and runs without
+a container runtime. Garage ignores those conditions and cannot back this
+service; see
 [Garage known issues](https://garagehq.deuxfleurs.fr/documentation/reference-manual/known-issues/).
 Floci is a test emulator, not a storage backend for deployment.
 

@@ -1,14 +1,9 @@
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-  inputs.floci-nix = {
-    url = "github:imxade/floci-nix/159be03d4fb1d80172084e1df7d9ff13866f1334";
-    inputs.nixpkgs.follows = "nixpkgs";
-  };
   outputs =
     {
       self,
       nixpkgs,
-      floci-nix,
       ...
     }:
     let
@@ -26,10 +21,7 @@
           arch = pkgs.stdenv.hostPlatform.parsed.cpu.name;
         };
         ukc-release = import ./nix/ukc-release.nix { inherit pkgs; };
-        floci = import ./nix/floci.nix {
-          inherit pkgs;
-          image = floci-nix.packages.${pkgs.stdenv.hostPlatform.system}.aws-image;
-        };
+        floci = import ./nix/floci.nix { inherit pkgs; };
         floci-dev = import ./nix/floci-dev.nix { inherit pkgs floci; };
         default = uketsuke;
       });
